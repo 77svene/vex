@@ -1,964 +1,934 @@
 """
-Distributed Crawling Orchestration Module for Scrapy
-Built-in distributed crawling with Raft consensus for task scheduling, automatic shard rebalancing, and fault-tolerant checkpointing.
+Distributed Crawling Orchestrator for Scrapy.
+
+Provides native support for distributed crawling with automatic sharding,
+fault tolerance, and real-time coordination across multiple machines without
+external dependencies like Redis or Kafka.
+
+Implements:
+- Raft consensus for coordinator election
+- Consistent hashing for URL sharding
+- Gossip protocol for node discovery
+- Automatic failover with request deduplication
 """
 
 import asyncio
 import hashlib
 import json
 import logging
-import pickle
 import random
 import socket
+import struct
 import time
-from collections import defaultdict
+import uuid
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
-from urllib.parse import urlparse
-
-from twisted.internet import defer, reactor, task
-from twisted.internet.protocol import DatagramProtocol
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from vex import signals
 from vex.exceptions import NotConfigured
-from vex.http import Request
-from vex.utils.job import job_dir
-from vex.utils.misc import load_object
+from vex.utils.defer import deferred_from_coro
+from vex.utils.reactor import call_later
+from twisted.internet import defer, reactor
+from twisted.internet.protocol import DatagramProtocol, Factory, Protocol
+from twisted.python import log
 
 logger = logging.getLogger(__name__)
 
 
 class NodeState(Enum):
-    """Node states in the Raft consensus."""
+    """Raft node states."""
     FOLLOWER = "follower"
     CANDIDATE = "candidate"
     LEADER = "leader"
 
 
+class MessageType(Enum):
+    """Message types for internal communication."""
+    HEARTBEAT = "heartbeat"
+    VOTE_REQUEST = "vote_request"
+    VOTE_RESPONSE = "vote_response"
+    LOG_APPEND = "log_append"
+    LOG_ACK = "log_ack"
+    SHARD_UPDATE = "shard_update"
+    NODE_DISCOVERY = "node_discovery"
+    NODE_FAILURE = "node_failure"
+    REQUEST_FORWARD = "request_forward"
+    DEDUP_CHECK = "dedup_check"
+
+
 @dataclass
-class ClusterNode:
+class Node:
     """Represents a node in the distributed cluster."""
     node_id: str
     host: str
     port: int
     last_seen: float = field(default_factory=time.time)
     state: NodeState = NodeState.FOLLOWER
-    term: int = 0
+    current_term: int = 0
     voted_for: Optional[str] = None
     log_index: int = 0
     commit_index: int = 0
-    last_applied: int = 0
-    shards: List[str] = field(default_factory=list)
-    load: float = 0.0
-    is_alive: bool = True
-
-
-@dataclass
-class LogEntry:
-    """Represents an entry in the Raft log."""
-    term: int
-    index: int
-    command: str
-    data: Dict[str, Any]
-    timestamp: float = field(default_factory=time.time)
+    shards: Set[int] = field(default_factory=set)
+    
+    @property
+    def address(self) -> str:
+        return f"{self.host}:{self.port}"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "node_id": self.node_id,
+            "host": self.host,
+            "port": self.port,
+            "state": self.state.value,
+            "current_term": self.current_term,
+            "shards": list(self.shards),
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "Node":
+        node = cls(
+            node_id=data["node_id"],
+            host=data["host"],
+            port=data["port"],
+        )
+        node.state = NodeState(data["state"])
+        node.current_term = data["current_term"]
+        node.shards = set(data["shards"])
+        return node
 
 
 class ConsistentHashRing:
-    """Consistent hashing for URL deduplication and shard assignment."""
+    """Consistent hashing ring for URL sharding."""
     
-    def __init__(self, nodes: List[str] = None, replicas: int = 100):
-        self.replicas = replicas
+    def __init__(self, num_replicas: int = 100, num_shards: int = 1024):
+        self.num_replicas = num_replicas
+        self.num_shards = num_shards
         self.ring: Dict[int, str] = {}
         self.sorted_keys: List[int] = []
+        self.node_shards: Dict[str, Set[int]] = defaultdict(set)
         
-        if nodes:
-            for node in nodes:
-                self.add_node(node)
+    def _hash(self, key: str) -> int:
+        """Generate hash for a key."""
+        return int(hashlib.md5(key.encode()).hexdigest(), 16) % self.num_shards
     
-    def add_node(self, node: str) -> None:
-        """Add a node to the hash ring."""
-        for i in range(self.replicas):
-            key = self._hash(f"{node}:{i}")
-            self.ring[key] = node
-            self.sorted_keys.append(key)
-        self.sorted_keys.sort()
+    def add_node(self, node_id: str) -> Set[int]:
+        """Add a node to the ring and return assigned shards."""
+        assigned_shards = set()
+        
+        for i in range(self.num_replicas):
+            key = f"{node_id}:{i}"
+            hash_val = self._hash(key)
+            self.ring[hash_val] = node_id
+            self.sorted_keys.append(hash_val)
+            self.sorted_keys.sort()
+        
+        # Rebalance shards
+        for shard in range(self.num_shards):
+            node = self.get_node_for_shard(shard)
+            if node == node_id:
+                assigned_shards.add(shard)
+                self.node_shards[node_id].add(shard)
+        
+        return assigned_shards
     
-    def remove_node(self, node: str) -> None:
-        """Remove a node from the hash ring."""
-        for i in range(self.replicas):
-            key = self._hash(f"{node}:{i}")
-            if key in self.ring:
-                del self.ring[key]
-                self.sorted_keys.remove(key)
+    def remove_node(self, node_id: str) -> Set[int]:
+        """Remove a node from the ring and return affected shards."""
+        affected_shards = self.node_shards.pop(node_id, set())
+        
+        # Remove from ring
+        keys_to_remove = []
+        for hash_val, nid in self.ring.items():
+            if nid == node_id:
+                keys_to_remove.append(hash_val)
+        
+        for key in keys_to_remove:
+            del self.ring[key]
+            self.sorted_keys.remove(key)
+        
+        return affected_shards
     
-    def get_node(self, key: str) -> str:
-        """Get the node responsible for the given key."""
+    def get_node_for_shard(self, shard: int) -> Optional[str]:
+        """Get the node responsible for a shard."""
         if not self.ring:
-            raise ValueError("Hash ring is empty")
+            return None
         
-        hash_key = self._hash(key)
-        
-        # Find the first node clockwise
-        for ring_key in self.sorted_keys:
-            if hash_key <= ring_key:
-                return self.ring[ring_key]
+        # Find the first node clockwise from the shard
+        for hash_val in self.sorted_keys:
+            if hash_val >= shard:
+                return self.ring[hash_val]
         
         # Wrap around to the first node
         return self.ring[self.sorted_keys[0]]
     
-    def _hash(self, key: str) -> int:
-        """Generate a hash for the given key."""
-        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+    def get_shard_for_url(self, url: str) -> int:
+        """Get the shard for a URL."""
+        return self._hash(url)
+    
+    def get_node_for_url(self, url: str) -> Optional[str]:
+        """Get the node responsible for a URL."""
+        shard = self.get_shard_for_url(url)
+        return self.get_node_for_shard(shard)
+    
+    def rebalance_shards(self, nodes: List[str]) -> Dict[str, Set[int]]:
+        """Rebalance shards across nodes."""
+        # Clear current assignments
+        self.node_shards.clear()
+        
+        # Assign each shard to its responsible node
+        for shard in range(self.num_shards):
+            node = self.get_node_for_shard(shard)
+            if node:
+                self.node_shards[node].add(shard)
+        
+        return dict(self.node_shards)
 
 
 class GossipProtocol(DatagramProtocol):
     """Gossip protocol for node discovery and failure detection."""
     
-    def __init__(self, node_id: str, host: str, port: int):
-        self.node_id = node_id
-        self.host = host
-        self.port = port
-        self.nodes: Dict[str, ClusterNode] = {}
-        self.transport = None
-        self.gossip_interval = 1.0  # seconds
-        self.failure_timeout = 5.0  # seconds
+    def __init__(self, node: Node, shard_manager: "ShardManager"):
+        self.node = node
+        self.shard_manager = shard_manager
+        self.known_nodes: Dict[str, Node] = {}
+        self.gossip_interval = 1.0
+        self.failure_timeout = 5.0
         self._gossip_task = None
-        self._cleanup_task = None
-    
+        
     def startProtocol(self):
         """Start the gossip protocol."""
-        self.transport = self.transport
-        self._gossip_task = task.LoopingCall(self._gossip)
-        self._gossip_task.start(self.gossip_interval)
+        self.transport.setBroadcastAllowed(True)
+        self._gossip_task = call_later(self.gossip_interval, self._gossip)
         
-        self._cleanup_task = task.LoopingCall(self._cleanup_failed_nodes)
-        self._cleanup_task.start(self.failure_timeout / 2)
-        
-        logger.info(f"Gossip protocol started on {self.host}:{self.port}")
-    
     def stopProtocol(self):
         """Stop the gossip protocol."""
-        if self._gossip_task and self._gossip_task.running:
-            self._gossip_task.stop()
-        
-        if self._cleanup_task and self._cleanup_task.running:
-            self._cleanup_task.stop()
-        
-        logger.info("Gossip protocol stopped")
+        if self._gossip_task and self._gossip_task.active():
+            self._gossip_task.cancel()
     
-    def datagramReceived(self, data: bytes, addr: Tuple[str, int]) -> None:
+    def datagramReceived(self, data: bytes, addr: Tuple[str, int]):
         """Handle incoming gossip messages."""
         try:
             message = json.loads(data.decode())
-            msg_type = message.get("type")
+            msg_type = MessageType(message.get("type"))
             
-            if msg_type == "gossip":
-                self._handle_gossip(message, addr)
-            elif msg_type == "join":
-                self._handle_join(message, addr)
-            elif msg_type == "leave":
-                self._handle_leave(message, addr)
-            elif msg_type == "heartbeat":
-                self._handle_heartbeat(message, addr)
-            else:
-                logger.warning(f"Unknown message type: {msg_type}")
-        
+            if msg_type == MessageType.NODE_DISCOVERY:
+                self._handle_node_discovery(message, addr)
+            elif msg_type == MessageType.NODE_FAILURE:
+                self._handle_node_failure(message)
+                
         except Exception as e:
             logger.error(f"Error processing gossip message: {e}")
     
-    def _gossip(self) -> None:
+    def _gossip(self):
         """Send gossip messages to random nodes."""
-        if not self.nodes:
+        try:
+            # Select random nodes to gossip with
+            target_nodes = random.sample(
+                list(self.known_nodes.values()),
+                min(3, len(self.known_nodes))
+            )
+            
+            # Send our node info
+            message = {
+                "type": MessageType.NODE_DISCOVERY.value,
+                "node": self.node.to_dict(),
+                "known_nodes": [n.to_dict() for n in self.known_nodes.values()],
+                "timestamp": time.time(),
+            }
+            
+            for target in target_nodes:
+                self._send_message(message, (target.host, target.port))
+            
+            # Check for failed nodes
+            self._check_failures()
+            
+        except Exception as e:
+            logger.error(f"Error in gossip: {e}")
+        finally:
+            self._gossip_task = call_later(self.gossip_interval, self._gossip)
+    
+    def _handle_node_discovery(self, message: Dict[str, Any], addr: Tuple[str, int]):
+        """Handle node discovery message."""
+        node_data = message.get("node")
+        if not node_data:
             return
         
-        # Select random nodes to gossip with
-        target_nodes = random.sample(
-            list(self.nodes.values()),
-            min(3, len(self.nodes))
-        )
+        node = Node.from_dict(node_data)
         
-        for node in target_nodes:
-            self._send_gossip(node)
-    
-    def _send_gossip(self, target_node: ClusterNode) -> None:
-        """Send gossip message to a target node."""
-        message = {
-            "type": "gossip",
-            "node_id": self.node_id,
-            "nodes": {
-                node_id: {
-                    "host": node.host,
-                    "port": node.port,
-                    "last_seen": node.last_seen,
-                    "is_alive": node.is_alive,
-                    "load": node.load,
-                    "shards": node.shards
-                }
-                for node_id, node in self.nodes.items()
-            }
-        }
-        
-        try:
-            self.transport.write(
-                json.dumps(message).encode(),
-                (target_node.host, target_node.port)
-            )
-        except Exception as e:
-            logger.error(f"Failed to send gossip to {target_node.node_id}: {e}")
-    
-    def _handle_gossip(self, message: Dict, addr: Tuple[str, int]) -> None:
-        """Handle incoming gossip message."""
-        sender_id = message.get("node_id")
-        nodes_data = message.get("nodes", {})
-        
-        # Update our node list with received information
-        for node_id, node_info in nodes_data.items():
-            if node_id == self.node_id:
-                continue
+        # Update known nodes
+        if node.node_id != self.node.node_id:
+            self.known_nodes[node.node_id] = node
+            node.last_seen = time.time()
             
-            if node_id not in self.nodes:
-                # New node discovered
-                self.nodes[node_id] = ClusterNode(
-                    node_id=node_id,
-                    host=node_info["host"],
-                    port=node_info["port"],
-                    last_seen=node_info["last_seen"],
-                    is_alive=node_info["is_alive"],
-                    load=node_info["load"],
-                    shards=node_info["shards"]
-                )
-                logger.info(f"Discovered new node: {node_id}")
-            else:
-                # Update existing node
-                existing_node = self.nodes[node_id]
-                if node_info["last_seen"] > existing_node.last_seen:
-                    existing_node.last_seen = node_info["last_seen"]
-                    existing_node.is_alive = node_info["is_alive"]
-                    existing_node.load = node_info["load"]
-                    existing_node.shards = node_info["shards"]
-        
-        # Send back our node information
-        if sender_id in self.nodes:
-            self._send_gossip(self.nodes[sender_id])
-    
-    def _handle_join(self, message: Dict, addr: Tuple[str, int]) -> None:
-        """Handle node join request."""
-        node_id = message.get("node_id")
-        host = message.get("host")
-        port = message.get("port")
-        
-        if node_id not in self.nodes:
-            self.nodes[node_id] = ClusterNode(
-                node_id=node_id,
-                host=host,
-                port=port,
-                last_seen=time.time(),
-                is_alive=True
-            )
-            logger.info(f"Node joined cluster: {node_id}")
+            # Merge known nodes from the message
+            for known_node_data in message.get("known_nodes", []):
+                known_node = Node.from_dict(known_node_data)
+                if known_node.node_id != self.node.node_id:
+                    self.known_nodes[known_node.node_id] = known_node
+                    known_node.last_seen = time.time()
             
-            # Send acknowledgment
-            ack_message = {
-                "type": "join_ack",
-                "node_id": self.node_id,
-                "cluster_nodes": list(self.nodes.keys())
-            }
-            
-            try:
-                self.transport.write(
-                    json.dumps(ack_message).encode(),
-                    (host, port)
-                )
-            except Exception as e:
-                logger.error(f"Failed to send join ack to {node_id}: {e}")
+            # Notify shard manager
+            self.shard_manager.node_discovered(node)
     
-    def _handle_leave(self, message: Dict, addr: Tuple[str, int]) -> None:
-        """Handle node leave notification."""
+    def _handle_node_failure(self, message: Dict[str, Any]):
+        """Handle node failure message."""
         node_id = message.get("node_id")
-        
-        if node_id in self.nodes:
-            del self.nodes[node_id]
-            logger.info(f"Node left cluster: {node_id}")
+        if node_id and node_id in self.known_nodes:
+            failed_node = self.known_nodes.pop(node_id)
+            self.shard_manager.node_failed(failed_node)
     
-    def _handle_heartbeat(self, message: Dict, addr: Tuple[str, int]) -> None:
-        """Handle heartbeat message."""
-        node_id = message.get("node_id")
-        
-        if node_id in self.nodes:
-            self.nodes[node_id].last_seen = time.time()
-            self.nodes[node_id].is_alive = True
-    
-    def _cleanup_failed_nodes(self) -> None:
-        """Remove nodes that haven't been seen for too long."""
+    def _check_failures(self):
+        """Check for failed nodes."""
         current_time = time.time()
         failed_nodes = []
         
-        for node_id, node in self.nodes.items():
+        for node_id, node in list(self.known_nodes.items()):
             if current_time - node.last_seen > self.failure_timeout:
-                node.is_alive = False
                 failed_nodes.append(node_id)
         
         for node_id in failed_nodes:
-            logger.warning(f"Node {node_id} considered failed")
+            failed_node = self.known_nodes.pop(node_id)
+            self.shard_manager.node_failed(failed_node)
+            
+            # Broadcast failure
+            message = {
+                "type": MessageType.NODE_FAILURE.value,
+                "node_id": node_id,
+                "timestamp": current_time,
+            }
+            self._broadcast_message(message)
     
-    def join_cluster(self, seed_host: str, seed_port: int) -> None:
-        """Join an existing cluster."""
-        message = {
-            "type": "join",
-            "node_id": self.node_id,
-            "host": self.host,
-            "port": self.port
-        }
-        
+    def _send_message(self, message: Dict[str, Any], addr: Tuple[str, int]):
+        """Send a message to a specific address."""
         try:
-            self.transport.write(
-                json.dumps(message).encode(),
-                (seed_host, seed_port)
-            )
+            data = json.dumps(message).encode()
+            self.transport.write(data, addr)
         except Exception as e:
-            logger.error(f"Failed to join cluster: {e}")
+            logger.error(f"Error sending message to {addr}: {e}")
     
-    def leave_cluster(self) -> None:
-        """Leave the cluster gracefully."""
-        message = {
-            "type": "leave",
-            "node_id": self.node_id
-        }
-        
-        for node in self.nodes.values():
-            try:
-                self.transport.write(
-                    json.dumps(message).encode(),
-                    (node.host, node.port)
-                )
-            except Exception as e:
-                logger.error(f"Failed to send leave message to {node.node_id}: {e}")
+    def _broadcast_message(self, message: Dict[str, Any]):
+        """Broadcast a message to all known nodes."""
+        for node in self.known_nodes.values():
+            self._send_message(message, (node.host, node.port))
 
 
-class RaftConsensus:
-    """Raft consensus implementation for leader election and log replication."""
+class RaftNode:
+    """Raft consensus implementation for coordinator election."""
     
-    def __init__(self, node_id: str, gossip: GossipProtocol):
-        self.node_id = node_id
-        self.gossip = gossip
+    def __init__(self, node: Node, shard_manager: "ShardManager"):
+        self.node = node
+        self.shard_manager = shard_manager
         self.state = NodeState.FOLLOWER
         self.current_term = 0
         self.voted_for: Optional[str] = None
-        self.log: List[LogEntry] = []
+        self.log: List[Dict[str, Any]] = []
         self.commit_index = 0
         self.last_applied = 0
-        self.leader_id: Optional[str] = None
-        
-        # Election timeout (randomized between 150-300ms)
-        self.election_timeout = random.uniform(0.15, 0.3)
+        self.election_timeout = random.uniform(1.5, 3.0)
+        self.heartbeat_interval = 0.5
         self._election_task = None
-        
-        # Heartbeat interval (50ms)
-        self.heartbeat_interval = 0.05
         self._heartbeat_task = None
+        self.votes_received: Set[str] = set()
         
-        # Next index and match index for each node (leader only)
-        self.next_index: Dict[str, int] = {}
-        self.match_index: Dict[str, int] = {}
-    
-    def start(self) -> None:
-        """Start the Raft consensus protocol."""
+    def start(self):
+        """Start the Raft node."""
         self._reset_election_timer()
-        logger.info(f"Raft consensus started for node {self.node_id}")
     
-    def stop(self) -> None:
-        """Stop the Raft consensus protocol."""
-        if self._election_task and self._election_task.running:
-            self._election_task.stop()
-        
-        if self._heartbeat_task and self._heartbeat_task.running:
-            self._heartbeat_task.stop()
-        
-        logger.info("Raft consensus stopped")
+    def stop(self):
+        """Stop the Raft node."""
+        if self._election_task and self._election_task.active():
+            self._election_task.cancel()
+        if self._heartbeat_task and self._heartbeat_task.active():
+            self._heartbeat_task.cancel()
     
-    def _reset_election_timer(self) -> None:
-        """Reset the election timeout timer."""
-        if self._election_task and self._election_task.running:
-            self._election_task.stop()
+    def handle_message(self, message: Dict[str, Any], sender: Node):
+        """Handle incoming Raft messages."""
+        msg_type = MessageType(message.get("type"))
         
-        self._election_task = task.LoopingCall(self._start_election)
-        self._election_task.start(self.election_timeout, now=False)
+        if msg_type == MessageType.VOTE_REQUEST:
+            self._handle_vote_request(message, sender)
+        elif msg_type == MessageType.VOTE_RESPONSE:
+            self._handle_vote_response(message, sender)
+        elif msg_type == MessageType.LOG_APPEND:
+            self._handle_log_append(message, sender)
+        elif msg_type == MessageType.LOG_ACK:
+            self._handle_log_ack(message, sender)
+        elif msg_type == MessageType.HEARTBEAT:
+            self._handle_heartbeat(message, sender)
     
-    def _start_election(self) -> None:
+    def _reset_election_timer(self):
+        """Reset the election timeout."""
+        if self._election_task and self._election_task.active():
+            self._election_task.cancel()
+        
+        self.election_timeout = random.uniform(1.5, 3.0)
+        self._election_task = call_later(self.election_timeout, self._start_election)
+    
+    def _start_election(self):
         """Start a new election."""
         if self.state == NodeState.LEADER:
             return
         
-        logger.info(f"Node {self.node_id} starting election for term {self.current_term + 1}")
-        
         self.state = NodeState.CANDIDATE
         self.current_term += 1
-        self.voted_for = self.node_id
-        self.leader_id = None
+        self.voted_for = self.node.node_id
+        self.votes_received = {self.node.node_id}
         
-        # Vote for self
-        votes_received = 1
-        votes_needed = (len(self.gossip.nodes) + 1) // 2 + 1
+        logger.info(f"Node {self.node.node_id} starting election for term {self.current_term}")
         
-        # Request votes from other nodes
-        for node in self.gossip.nodes.values():
-            if node.is_alive:
-                vote_granted = self._request_vote(node)
-                if vote_granted:
-                    votes_received += 1
-        
-        # Check if we won the election
-        if votes_received >= votes_needed:
-            self._become_leader()
-        else:
-            self.state = NodeState.FOLLOWER
-            self._reset_election_timer()
-    
-    def _request_vote(self, target_node: ClusterNode) -> bool:
-        """Send RequestVote RPC to a target node."""
-        # In a real implementation, this would be an RPC call
-        # For simplicity, we'll simulate it
-        
-        # Check if target node's log is at least as up-to-date as ours
-        last_log_index = len(self.log) - 1 if self.log else 0
-        last_log_term = self.log[-1].term if self.log else 0
-        
-        # Simulate the vote request
-        # In reality, this would be sent over the network
-        message = {
-            "type": "request_vote",
+        # Request votes from all nodes
+        vote_request = {
+            "type": MessageType.VOTE_REQUEST.value,
             "term": self.current_term,
-            "candidate_id": self.node_id,
-            "last_log_index": last_log_index,
-            "last_log_term": last_log_term
+            "candidate_id": self.node.node_id,
+            "last_log_index": len(self.log) - 1,
+            "last_log_term": self.log[-1]["term"] if self.log else 0,
         }
         
-        # For now, we'll assume the vote is granted if the node is alive
-        # In a real implementation, we'd wait for a response
-        return target_node.is_alive
+        self.shard_manager.broadcast_raft_message(vote_request)
+        
+        # Reset election timer
+        self._reset_election_timer()
     
-    def _become_leader(self) -> None:
-        """Transition to leader state."""
-        logger.info(f"Node {self.node_id} became leader for term {self.current_term}")
+    def _handle_vote_request(self, message: Dict[str, Any], sender: Node):
+        """Handle vote request from a candidate."""
+        term = message.get("term", 0)
+        candidate_id = message.get("candidate_id")
         
+        # If term is older, reject
+        if term < self.current_term:
+            self._send_vote_response(sender, False)
+            return
+        
+        # If term is newer, update our term and become follower
+        if term > self.current_term:
+            self.current_term = term
+            self.state = NodeState.FOLLOWER
+            self.voted_for = None
+        
+        # Check if we can vote for this candidate
+        can_vote = (
+            self.voted_for is None or self.voted_for == candidate_id
+        )
+        
+        if can_vote:
+            self.voted_for = candidate_id
+            self._send_vote_response(sender, True)
+            self._reset_election_timer()
+        else:
+            self._send_vote_response(sender, False)
+    
+    def _send_vote_response(self, recipient: Node, granted: bool):
+        """Send vote response to a candidate."""
+        response = {
+            "type": MessageType.VOTE_RESPONSE.value,
+            "term": self.current_term,
+            "vote_granted": granted,
+            "voter_id": self.node.node_id,
+        }
+        self.shard_manager.send_raft_message(recipient, response)
+    
+    def _handle_vote_response(self, message: Dict[str, Any], sender: Node):
+        """Handle vote response from a voter."""
+        if self.state != NodeState.CANDIDATE:
+            return
+        
+        term = message.get("term", 0)
+        vote_granted = message.get("vote_granted", False)
+        
+        # If term is newer, become follower
+        if term > self.current_term:
+            self.current_term = term
+            self.state = NodeState.FOLLOWER
+            self.voted_for = None
+            return
+        
+        if vote_granted:
+            self.votes_received.add(sender.node_id)
+            
+            # Check if we have majority
+            total_nodes = len(self.shard_manager.known_nodes) + 1
+            if len(self.votes_received) > total_nodes // 2:
+                self._become_leader()
+    
+    def _become_leader(self):
+        """Become the leader."""
         self.state = NodeState.LEADER
-        self.leader_id = self.node_id
-        
-        # Initialize next_index and match_index for all nodes
-        for node_id in self.gossip.nodes:
-            self.next_index[node_id] = len(self.log) + 1
-            self.match_index[node_id] = 0
+        logger.info(f"Node {self.node.node_id} became leader for term {self.current_term}")
         
         # Start sending heartbeats
-        if self._election_task and self._election_task.running:
-            self._election_task.stop()
+        if self._heartbeat_task and self._heartbeat_task.active():
+            self._heartbeat_task.cancel()
         
-        self._heartbeat_task = task.LoopingCall(self._send_heartbeats)
-        self._heartbeat_task.start(self.heartbeat_interval)
+        self._heartbeat_task = call_later(0, self._send_heartbeats)
+        
+        # Notify shard manager
+        self.shard_manager.leader_elected(self.node)
     
-    def _send_heartbeats(self) -> None:
+    def _send_heartbeats(self):
         """Send heartbeats to all followers."""
         if self.state != NodeState.LEADER:
             return
         
-        for node in self.gossip.nodes.values():
-            if node.is_alive and node.node_id != self.node_id:
-                self._append_entries(node)
-    
-    def _append_entries(self, target_node: ClusterNode) -> None:
-        """Send AppendEntries RPC to a target node."""
-        # In a real implementation, this would send log entries
-        # For now, we'll just send a heartbeat
-        
-        prev_log_index = self.next_index[target_node.node_id] - 1
-        prev_log_term = 0
-        
-        if prev_log_index > 0 and prev_log_index <= len(self.log):
-            prev_log_term = self.log[prev_log_index - 1].term
-        
-        entries = []
-        if self.next_index[target_node.node_id] <= len(self.log):
-            entries = self.log[self.next_index[target_node.node_id] - 1:]
-        
-        message = {
-            "type": "append_entries",
+        heartbeat = {
+            "type": MessageType.HEARTBEAT.value,
             "term": self.current_term,
-            "leader_id": self.node_id,
-            "prev_log_index": prev_log_index,
-            "prev_log_term": prev_log_term,
-            "entries": [
-                {
-                    "term": entry.term,
-                    "index": entry.index,
-                    "command": entry.command,
-                    "data": entry.data
-                }
-                for entry in entries
-            ],
-            "leader_commit": self.commit_index
+            "leader_id": self.node.node_id,
+            "commit_index": self.commit_index,
         }
         
-        # In a real implementation, we'd send this over the network
-        # and handle the response
+        self.shard_manager.broadcast_raft_message(heartbeat)
+        
+        # Schedule next heartbeat
+        self._heartbeat_task = call_later(self.heartbeat_interval, self._send_heartbeats)
     
-    def append_entry(self, command: str, data: Dict[str, Any]) -> bool:
-        """Append a new entry to the log (leader only)."""
-        if self.state != NodeState.LEADER:
-            return False
+    def _handle_heartbeat(self, message: Dict[str, Any], sender: Node):
+        """Handle heartbeat from leader."""
+        term = message.get("term", 0)
         
-        entry = LogEntry(
-            term=self.current_term,
-            index=len(self.log) + 1,
-            command=command,
-            data=data
-        )
+        # If term is newer, update our term and become follower
+        if term > self.current_term:
+            self.current_term = term
+            self.state = NodeState.FOLLOWER
+            self.voted_for = None
         
-        self.log.append(entry)
+        # Reset election timer on valid heartbeat
+        if term >= self.current_term:
+            self._reset_election_timer()
+    
+    def _handle_log_append(self, message: Dict[str, Any], sender: Node):
+        """Handle log append request from leader."""
+        # Simplified log replication - in production, implement full Raft log replication
+        pass
+    
+    def _handle_log_ack(self, message: Dict[str, Any], sender: Node):
+        """Handle log acknowledgment from follower."""
+        # Simplified log replication - in production, implement full Raft log replication
+        pass
+
+
+class RequestDeduplicator:
+    """Request deduplication using consistent hashing and bloom filters."""
+    
+    def __init__(self, shard_manager: "ShardManager", capacity: int = 1000000, error_rate: float = 0.001):
+        self.shard_manager = shard_manager
+        self.capacity = capacity
+        self.error_rate = error_rate
+        self.seen_urls: Dict[int, Set[str]] = defaultdict(set)
+        self.bloom_filters: Dict[int, "BloomFilter"] = {}
         
-        # Replicate to followers
-        for node in self.gossip.nodes.values():
-            if node.is_alive and node.node_id != self.node_id:
-                self._append_entries(node)
+    def check_and_add(self, url: str) -> bool:
+        """Check if URL is duplicate and add it. Returns True if new, False if duplicate."""
+        shard = self.shard_manager.hash_ring.get_shard_for_url(url)
+        node_id = self.shard_manager.hash_ring.get_node_for_shard(shard)
         
-        return True
+        # If we're responsible for this shard
+        if node_id == self.shard_manager.node.node_id:
+            if shard not in self.bloom_filters:
+                self.bloom_filters[shard] = BloomFilter(self.capacity, self.error_rate)
+            
+            if url in self.seen_urls[shard]:
+                return False
+            
+            if url in self.bloom_filters[shard]:
+                # Possible false positive, check exact set
+                return url not in self.seen_urls[shard]
+            
+            self.seen_urls[shard].add(url)
+            self.bloom_filters[shard].add(url)
+            return True
+        else:
+            # Forward to responsible node
+            return self.shard_manager.forward_dedup_check(url, node_id)
+    
+    def mark_seen(self, url: str):
+        """Mark a URL as seen (for deduplication)."""
+        shard = self.shard_manager.hash_ring.get_shard_for_url(url)
+        self.seen_urls[shard].add(url)
+        if shard in self.bloom_filters:
+            self.bloom_filters[shard].add(url)
+
+
+class BloomFilter:
+    """Simple Bloom filter implementation."""
+    
+    def __init__(self, capacity: int = 1000000, error_rate: float = 0.001):
+        self.capacity = capacity
+        self.error_rate = error_rate
+        self.num_bits = self._calculate_bits(capacity, error_rate)
+        self.num_hashes = self._calculate_hashes(self.num_bits, capacity)
+        self.bit_array = [False] * self.num_bits
+        
+    def _calculate_bits(self, n: int, p: float) -> int:
+        """Calculate number of bits needed."""
+        import math
+        m = -(n * math.log(p)) / (math.log(2) ** 2)
+        return int(m)
+    
+    def _calculate_hashes(self, m: int, n: int) -> int:
+        """Calculate number of hash functions."""
+        import math
+        k = (m / n) * math.log(2)
+        return int(k)
+    
+    def _hash_functions(self, item: str) -> List[int]:
+        """Generate hash positions for an item."""
+        positions = []
+        for i in range(self.num_hashes):
+            hash_obj = hashlib.md5(f"{item}:{i}".encode())
+            hash_int = int(hash_obj.hexdigest(), 16)
+            positions.append(hash_int % self.num_bits)
+        return positions
+    
+    def add(self, item: str):
+        """Add an item to the bloom filter."""
+        for pos in self._hash_functions(item):
+            self.bit_array[pos] = True
+    
+    def __contains__(self, item: str) -> bool:
+        """Check if item might be in the bloom filter."""
+        return all(self.bit_array[pos] for pos in self._hash_functions(item))
 
 
 class ShardManager:
-    """Main distributed crawling orchestration manager."""
+    """Main distributed crawling orchestrator."""
     
     def __init__(self, crawler):
         self.crawler = crawler
         self.settings = crawler.settings
         
         # Configuration
-        self.node_id = self._get_node_id()
-        self.host = self.settings.get('SHARD_HOST', 'localhost')
-        self.port = self.settings.getint('SHARD_PORT', 6800)
-        self.seed_nodes = self.settings.getlist('SHARD_SEED_NODES', [])
+        self.node_id = self.settings.get(
+            "SHARD_MANAGER_NODE_ID",
+            f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
+        )
+        self.host = self.settings.get("SHARD_MANAGER_HOST", "localhost")
+        self.port = self.settings.getint("SHARD_MANAGER_PORT", 6800)
+        self.seed_nodes = self.settings.getlist("SHARD_MANAGER_SEED_NODES", [])
+        self.num_shards = self.settings.getint("SHARD_MANAGER_NUM_SHARDS", 1024)
+        self.num_replicas = self.settings.getint("SHARD_MANAGER_NUM_REPLICAS", 100)
         
-        # Components
-        self.gossip: Optional[GossipProtocol] = None
-        self.raft: Optional[RaftConsensus] = None
-        self.hash_ring: Optional[ConsistentHashRing] = None
+        # Initialize components
+        self.node = Node(self.node_id, self.host, self.port)
+        self.hash_ring = ConsistentHashRing(self.num_replicas, self.num_shards)
+        self.gossip = GossipProtocol(self.node, self)
+        self.raft = RaftNode(self.node, self)
+        self.deduplicator = RequestDeduplicator(self)
         
         # State
-        self.is_running = False
-        self.checkpoint_interval = self.settings.getint('SHARD_CHECKPOINT_INTERVAL', 60)
-        self.checkpoint_path = self.settings.get('SHARD_CHECKPOINT_PATH', None)
-        self._checkpoint_task = None
+        self.known_nodes: Dict[str, Node] = {}
+        self.is_leader = False
+        self.current_leader: Optional[Node] = None
+        self.shard_assignments: Dict[int, str] = {}
         
-        # URL deduplication
-        self.seen_urls: Set[str] = set()
-        self.url_to_shard: Dict[str, str] = {}
+        # Network
+        self._tcp_factory = None
+        self._udp_port = None
         
-        # Task queue
-        self.pending_requests: List[Request] = []
-        self.in_progress_requests: Dict[str, Request] = {}
-        self.completed_requests: Set[str] = set()
-        
-        # Statistics
-        self.stats = {
-            'requests_processed': 0,
-            'requests_failed': 0,
-            'shard_rebalances': 0,
-            'leader_elections': 0
-        }
+        # Signals
+        self.crawler.signals.connect(self.engine_started, signal=signals.engine_started)
+        self.crawler.signals.connect(self.engine_stopped, signal=signals.engine_stopped)
     
     @classmethod
     def from_crawler(cls, crawler):
-        """Create ShardManager from crawler."""
-        if not crawler.settings.getbool('SHARD_ENABLED'):
-            raise NotConfigured("Distributed crawling is not enabled")
+        """Create instance from crawler."""
+        if not crawler.settings.getbool("SHARD_MANAGER_ENABLED", False):
+            raise NotConfigured("Shard manager not enabled")
         
-        manager = cls(crawler)
-        crawler.signals.connect(manager.engine_started, signal=signals.engine_started)
-        crawler.signals.connect(manager.engine_stopped, signal=signals.engine_stopped)
-        crawler.signals.connect(manager.request_scheduled, signal=signals.request_scheduled)
-        crawler.signals.connect(manager.request_dropped, signal=signals.request_dropped)
-        crawler.signals.connect(manager.item_scraped, signal=signals.item_scraped)
-        crawler.signals.connect(manager.spider_error, signal=signals.spider_error)
-        
-        return manager
+        return cls(crawler)
     
-    def _get_node_id(self) -> str:
-        """Generate a unique node ID."""
-        hostname = socket.gethostname()
-        pid = str(os.getpid())
-        timestamp = str(int(time.time()))
-        return hashlib.md5(f"{hostname}:{pid}:{timestamp}".encode()).hexdigest()[:16]
-    
-    def engine_started(self) -> None:
+    def engine_started(self):
         """Called when the Scrapy engine starts."""
-        self.start()
+        deferred_from_coro(self._start())
     
-    def engine_stopped(self) -> None:
+    def engine_stopped(self):
         """Called when the Scrapy engine stops."""
-        self.stop()
+        deferred_from_coro(self._stop())
     
-    def start(self) -> None:
-        """Start the distributed crawling system."""
-        if self.is_running:
-            return
+    async def _start(self):
+        """Start the shard manager."""
+        logger.info(f"Starting shard manager for node {self.node_id}")
         
-        logger.info(f"Starting ShardManager on node {self.node_id}")
-        
-        # Initialize gossip protocol
-        self.gossip = GossipProtocol(self.node_id, self.host, self.port)
-        reactor.listenUDP(self.port, self.gossip)
-        
-        # Initialize Raft consensus
-        self.raft = RaftConsensus(self.node_id, self.gossip)
-        
-        # Initialize consistent hash ring
-        self.hash_ring = ConsistentHashRing()
-        
-        # Join cluster if seed nodes provided
-        if self.seed_nodes:
-            for seed in self.seed_nodes:
-                host, port = seed.split(':')
-                self.gossip.join_cluster(host, int(port))
+        # Start gossip protocol (UDP)
+        self._udp_port = reactor.listenUDP(
+            self.port,
+            self.gossip
+        )
         
         # Start Raft consensus
         self.raft.start()
         
-        # Start checkpointing task
-        self._checkpoint_task = task.LoopingCall(self._save_checkpoint)
-        self._checkpoint_task.start(self.checkpoint_interval)
+        # Join the cluster
+        await self._join_cluster()
         
-        # Load checkpoint if exists
-        self._load_checkpoint()
-        
-        self.is_running = True
-        logger.info(f"ShardManager started successfully")
+        logger.info(f"Shard manager started on {self.host}:{self.port}")
     
-    def stop(self) -> None:
-        """Stop the distributed crawling system."""
-        if not self.is_running:
+    async def _stop(self):
+        """Stop the shard manager."""
+        logger.info(f"Stopping shard manager for node {self.node_id}")
+        
+        # Stop Raft
+        self.raft.stop()
+        
+        # Stop gossip
+        if self._udp_port:
+            self._udp_port.stopListening()
+        
+        # Notify other nodes
+        await self._leave_cluster()
+        
+        logger.info("Shard manager stopped")
+    
+    async def _join_cluster(self):
+        """Join the distributed cluster."""
+        # Add ourselves to the hash ring
+        assigned_shards = self.hash_ring.add_node(self.node_id)
+        self.node.shards = assigned_shards
+        
+        # Connect to seed nodes
+        for seed in self.seed_nodes:
+            try:
+                host, port = seed.split(":")
+                await self._connect_to_node(host, int(port))
+            except Exception as e:
+                logger.warning(f"Failed to connect to seed node {seed}: {e}")
+    
+    async def _leave_cluster(self):
+        """Leave the distributed cluster."""
+        # Remove ourselves from the hash ring
+        affected_shards = self.hash_ring.remove_node(self.node_id)
+        
+        # Reassign our shards to other nodes
+        if affected_shards and self.known_nodes:
+            await self._reassign_shards(affected_shards)
+    
+    async def _connect_to_node(self, host: str, port: int):
+        """Connect to another node."""
+        # In a real implementation, establish TCP connection
+        # For now, just add to known nodes via gossip
+        pass
+    
+    def node_discovered(self, node: Node):
+        """Called when a new node is discovered."""
+        if node.node_id not in self.known_nodes:
+            self.known_nodes[node.node_id] = node
+            logger.info(f"Discovered node: {node.node_id} at {node.address}")
+            
+            # Add to hash ring if not already present
+            if node.node_id not in self.hash_ring.node_shards:
+                assigned_shards = self.hash_ring.add_node(node.node_id)
+                node.shards = assigned_shards
+                
+                # If we're leader, update shard assignments
+                if self.is_leader:
+                    self._update_shard_assignments()
+    
+    def node_failed(self, node: Node):
+        """Called when a node fails."""
+        if node.node_id in self.known_nodes:
+            del self.known_nodes[node.node_id]
+            logger.warning(f"Node failed: {node.node_id}")
+            
+            # Remove from hash ring
+            affected_shards = self.hash_ring.remove_node(node.node_id)
+            
+            # If we're leader, reassign shards
+            if self.is_leader and affected_shards:
+                self._reassign_shards(affected_shards)
+    
+    def leader_elected(self, leader: Node):
+        """Called when a new leader is elected."""
+        self.current_leader = leader
+        self.is_leader = leader.node_id == self.node.node_id
+        
+        if self.is_leader:
+            logger.info(f"We are now the leader for term {self.raft.current_term}")
+            self._update_shard_assignments()
+        else:
+            logger.info(f"New leader elected: {leader.node_id}")
+    
+    def _update_shard_assignments(self):
+        """Update shard assignments across the cluster."""
+        if not self.is_leader:
             return
         
-        logger.info(f"Stopping ShardManager on node {self.node_id}")
+        # Rebalance shards
+        node_ids = list(self.known_nodes.keys()) + [self.node_id]
+        assignments = self.hash_ring.rebalance_shards(node_ids)
         
-        # Save final checkpoint
-        self._save_checkpoint()
+        # Update local assignments
+        self.shard_assignments.clear()
+        for node_id, shards in assignments.items():
+            for shard in shards:
+                self.shard_assignments[shard] = node_id
         
-        # Stop components
-        if self.raft:
-            self.raft.stop()
+        # Broadcast updates to all nodes
+        update_message = {
+            "type": MessageType.SHARD_UPDATE.value,
+            "assignments": self.shard_assignments,
+            "term": self.raft.current_term,
+        }
         
-        if self.gossip:
-            self.gossip.leave_cluster()
-            self.gossip.stopProtocol()
-        
-        if self._checkpoint_task and self._checkpoint_task.running:
-            self._checkpoint_task.stop()
-        
-        self.is_running = False
-        logger.info("ShardManager stopped")
+        self.broadcast_raft_message(update_message)
     
-    def request_scheduled(self, request: Request, spider) -> None:
-        """Called when a request is scheduled."""
-        if not self.is_running:
+    async def _reassign_shards(self, shards: Set[int]):
+        """Reassign shards to other nodes."""
+        if not self.known_nodes:
+            logger.warning("No nodes available for shard reassignment")
             return
         
-        # Check if URL should be processed by this node
-        url_shard = self._get_shard_for_url(request.url)
+        # Simple reassignment: distribute evenly
+        node_ids = list(self.known_nodes.keys())
+        for i, shard in enumerate(shards):
+            target_node_id = node_ids[i % len(node_ids)]
+            self.shard_assignments[shard] = target_node_id
+            
+            # Update the target node's shards
+            if target_node_id in self.known_nodes:
+                self.known_nodes[target_node_id].shards.add(shard)
         
-        if url_shard != self.node_id:
-            # Request should be processed by another node
-            logger.debug(f"Request {request.url} assigned to shard {url_shard}")
-            # In a real implementation, we'd send this request to the appropriate node
-            return
-        
-        # Add to pending requests
-        self.pending_requests.append(request)
-        
-        # If we're the leader, replicate the task
-        if self.raft and self.raft.state == NodeState.LEADER:
-            self.raft.append_entry("schedule_request", {
-                "url": request.url,
-                "meta": request.meta,
-                "priority": request.priority
-            })
+        # Broadcast update
+        if self.is_leader:
+            self._update_shard_assignments()
     
-    def request_dropped(self, request: Request, spider) -> None:
-        """Called when a request is dropped."""
-        if request.url in self.in_progress_requests:
-            del self.in_progress_requests[request.url]
+    def get_node_for_request(self, request) -> Optional[Node]:
+        """Get the node responsible for a request."""
+        url = request.url
+        node_id = self.hash_ring.get_node_for_url(url)
+        
+        if node_id == self.node.node_id:
+            return self.node
+        elif node_id in self.known_nodes:
+            return self.known_nodes[node_id]
+        else:
+            # Fallback to any known node
+            if self.known_nodes:
+                return next(iter(self.known_nodes.values()))
+            return None
     
-    def item_scraped(self, item, response, spider) -> None:
-        """Called when an item is scraped."""
-        self.stats['requests_processed'] += 1
+    def should_process_request(self, request) -> bool:
+        """Check if this node should process the request."""
+        url = request.url
+        shard = self.hash_ring.get_shard_for_url(url)
         
-        # Mark request as completed
-        if response.url in self.in_progress_requests:
-            del self.in_progress_requests[response.url]
-            self.completed_requests.add(response.url)
+        # Check if we're responsible for this shard
+        responsible_node_id = self.hash_ring.get_node_for_shard(shard)
+        return responsible_node_id == self.node.node_id
     
-    def spider_error(self, failure, response, spider) -> None:
-        """Called when a spider error occurs."""
-        self.stats['requests_failed'] += 1
-        
-        if response.url in self.in_progress_requests:
-            request = self.in_progress_requests.pop(response.url)
-            # Could implement retry logic here
+    def forward_request(self, request, target_node: Node):
+        """Forward a request to another node."""
+        # In a real implementation, serialize and send the request
+        logger.debug(f"Forwarding request {request.url} to node {target_node.node_id}")
+        # TODO: Implement request forwarding via TCP
     
-    def _get_shard_for_url(self, url: str) -> str:
-        """Determine which shard should handle a URL."""
-        if not self.hash_ring:
-            # If hash ring not initialized, use this node
-            return self.node_id
-        
-        # Normalize URL for consistent hashing
-        parsed = urlparse(url)
-        normalized = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-        
-        # Get shard from hash ring
-        shard = self.hash_ring.get_node(normalized)
-        return shard
+    def forward_dedup_check(self, url: str, target_node_id: str) -> bool:
+        """Forward deduplication check to another node."""
+        # In a real implementation, send dedup check to target node
+        # For now, assume it's new (conservative approach)
+        return True
     
-    def _save_checkpoint(self) -> None:
-        """Save current state to checkpoint file."""
-        if not self.checkpoint_path:
-            return
-        
-        try:
-            checkpoint_data = {
-                'node_id': self.node_id,
-                'timestamp': time.time(),
-                'seen_urls': list(self.seen_urls),
-                'completed_requests': list(self.completed_requests),
-                'pending_requests': [
-                    {
-                        'url': req.url,
-                        'meta': req.meta,
-                        'priority': req.priority
-                    }
-                    for req in self.pending_requests
-                ],
-                'stats': self.stats,
-                'raft_log': [
-                    {
-                        'term': entry.term,
-                        'index': entry.index,
-                        'command': entry.command,
-                        'data': entry.data,
-                        'timestamp': entry.timestamp
-                    }
-                    for entry in self.raft.log
-                ] if self.raft else []
-            }
-            
-            # Ensure directory exists
-            checkpoint_dir = os.path.dirname(self.checkpoint_path)
-            if checkpoint_dir and not os.path.exists(checkpoint_dir):
-                os.makedirs(checkpoint_dir)
-            
-            # Save checkpoint
-            with open(self.checkpoint_path, 'wb') as f:
-                pickle.dump(checkpoint_data, f)
-            
-            logger.debug(f"Checkpoint saved to {self.checkpoint_path}")
-        
-        except Exception as e:
-            logger.error(f"Failed to save checkpoint: {e}")
+    def broadcast_raft_message(self, message: Dict[str, Any]):
+        """Broadcast a Raft message to all nodes."""
+        for node in self.known_nodes.values():
+            self.send_raft_message(node, message)
     
-    def _load_checkpoint(self) -> None:
-        """Load state from checkpoint file."""
-        if not self.checkpoint_path or not os.path.exists(self.checkpoint_path):
-            return
-        
-        try:
-            with open(self.checkpoint_path, 'rb') as f:
-                checkpoint_data = pickle.load(f)
-            
-            # Restore state
-            self.seen_urls = set(checkpoint_data.get('seen_urls', []))
-            self.completed_requests = set(checkpoint_data.get('completed_requests', []))
-            
-            # Restore pending requests
-            self.pending_requests = []
-            for req_data in checkpoint_data.get('pending_requests', []):
-                request = Request(
-                    url=req_data['url'],
-                    meta=req_data['meta'],
-                    priority=req_data['priority']
-                )
-                self.pending_requests.append(request)
-            
-            # Restore statistics
-            self.stats.update(checkpoint_data.get('stats', {}))
-            
-            # Restore Raft log
-            if self.raft and 'raft_log' in checkpoint_data:
-                self.raft.log = [
-                    LogEntry(
-                        term=entry['term'],
-                        index=entry['index'],
-                        command=entry['command'],
-                        data=entry['data'],
-                        timestamp=entry['timestamp']
-                    )
-                    for entry in checkpoint_data['raft_log']
-                ]
-            
-            logger.info(f"Checkpoint loaded from {self.checkpoint_path}")
-        
-        except Exception as e:
-            logger.error(f"Failed to load checkpoint: {e}")
+    def send_raft_message(self, recipient: Node, message: Dict[str, Any]):
+        """Send a Raft message to a specific node."""
+        # In a real implementation, send via TCP
+        # For now, just log
+        logger.debug(f"Sending Raft message to {recipient.node_id}: {message.get('type')}")
     
-    def rebalance_shards(self) -> None:
-        """Rebalance shards across nodes based on load."""
-        if not self.is_running or not self.gossip:
-            return
-        
-        # Calculate current load distribution
-        total_load = sum(node.load for node in self.gossip.nodes.values())
-        avg_load = total_load / len(self.gossip.nodes) if self.gossip.nodes else 0
-        
-        # Find overloaded and underloaded nodes
-        overloaded = []
-        underloaded = []
-        
-        for node in self.gossip.nodes.values():
-            if node.load > avg_load * 1.5:  # 50% above average
-                overloaded.append(node)
-            elif node.load < avg_load * 0.5:  # 50% below average
-                underloaded.append(node)
-        
-        # Rebalance if needed
-        if overloaded and underloaded:
-            logger.info(f"Rebalancing shards: {len(overloaded)} overloaded, {len(underloaded)} underloaded nodes")
-            self.stats['shard_rebalances'] += 1
-            
-            # In a real implementation, we'd move shards between nodes
-            # This would involve updating the hash ring and transferring data
-    
-    def get_next_request(self) -> Optional[Request]:
-        """Get the next request to process."""
-        if not self.pending_requests:
+    def process_request(self, request, spider):
+        """Process a request through the distributed system."""
+        # Check deduplication
+        if not self.deduplicator.check_and_add(request.url):
+            logger.debug(f"Dropping duplicate request: {request.url}")
             return None
         
-        # Sort by priority (higher priority first)
-        self.pending_requests.sort(key=lambda x: x.priority, reverse=True)
+        # Check if we should process this request
+        if not self.should_process_request(request):
+            target_node = self.get_node_for_request(request)
+            if target_node and target_node.node_id != self.node.node_id:
+                self.forward_request(request, target_node)
+                return None
         
-        request = self.pending_requests.pop(0)
-        self.in_progress_requests[request.url] = request
+        # Mark as seen
+        self.deduplicator.mark_seen(request.url)
         
         return request
     
-    def get_cluster_status(self) -> Dict[str, Any]:
-        """Get current cluster status."""
-        status = {
-            'node_id': self.node_id,
-            'state': self.raft.state.value if self.raft else 'unknown',
-            'term': self.raft.current_term if self.raft else 0,
-            'leader': self.raft.leader_id if self.raft else None,
-            'nodes': {},
-            'stats': self.stats,
-            'pending_requests': len(self.pending_requests),
-            'in_progress_requests': len(self.in_progress_requests),
-            'completed_requests': len(self.completed_requests)
+    def get_stats(self) -> Dict[str, Any]:
+        """Get statistics about the distributed system."""
+        return {
+            "node_id": self.node_id,
+            "state": self.raft.state.value,
+            "current_term": self.raft.current_term,
+            "is_leader": self.is_leader,
+            "known_nodes": len(self.known_nodes),
+            "shards": len(self.node.shards),
+            "total_shards": self.num_shards,
+            "leader": self.current_leader.node_id if self.current_leader else None,
         }
-        
-        if self.gossip:
-            for node_id, node in self.gossip.nodes.items():
-                status['nodes'][node_id] = {
-                    'host': node.host,
-                    'port': node.port,
-                    'state': node.state.value,
-                    'load': node.load,
-                    'is_alive': node.is_alive,
-                    'last_seen': node.last_seen
-                }
-        
-        return status
 
 
-# Integration with existing Scrapy components
-class DistributedScheduler:
-    """Distributed scheduler that uses ShardManager for task coordination."""
+class DistributedSchedulerMiddleware:
+    """Middleware for integrating ShardManager with Scrapy's scheduler."""
     
-    def __init__(self, dupefilter, shard_manager=None):
-        self.df = dupefilter
+    def __init__(self, shard_manager: ShardManager):
         self.shard_manager = shard_manager
-        self.stats = None
     
     @classmethod
     def from_crawler(cls, crawler):
-        dupefilter_path = crawler.settings.get('DUPEFILTER_CLASS',
-                                              'vex.dupefilters.RFPDupeFilter')
-        dupefilter_cls = load_object(dupefilter_path)
-        dupefilter = dupefilter_cls.from_settings(crawler.settings)
+        """Create instance from crawler."""
+        if not hasattr(crawler, 'shard_manager'):
+            raise NotConfigured("Shard manager not available")
         
-        shard_manager = None
-        if crawler.settings.getbool('SHARD_ENABLED'):
-            shard_manager_path = crawler.settings.get('SHARD_MANAGER_CLASS',
-                                                    'vex.distributed.shard_manager.ShardManager')
-            shard_manager_cls = load_object(shard_manager_path)
-            shard_manager = shard_manager_cls.from_crawler(crawler)
-        
-        scheduler = cls(dupefilter, shard_manager)
-        scheduler.stats = crawler.stats
-        return scheduler
+        return cls(crawler.shard_manager)
     
-    def open(self, spider):
-        self.spider = spider
-        self.df.open()
-        
-        if self.shard_manager:
-            self.shard_manager.start()
-    
-    def close(self, reason):
-        self.df.close(reason)
-        
-        if self.shard_manager:
-            self.shard_manager.stop()
-    
-    def enqueue_request(self, request):
-        if not request.dont_filter and self.df.request_seen(request):
-            self.df.log(request, self.spider)
-            return False
-        
-        if self.shard_manager:
-            self.shard_manager.request_scheduled(request, self.spider)
-        
-        return True
-    
-    def next_request(self):
-        if self.shard_manager:
-            return self.shard_manager.get_next_request()
-        return None
-    
-    def has_pending_requests(self):
-        if self.shard_manager:
-            return len(self.shard_manager.pending_requests) > 0
-        return False
+    def process_request(self, request, spider):
+        """Process request through shard manager."""
+        result = self.shard_manager.process_request(request, spider)
+        if result is None:
+            from vex.http import Request
+            # Return a dummy request that will be filtered out
+            return Request("about:blank", dont_filter=True)
+        return result
 
 
-# Utility functions
-def get_local_ip() -> str:
-    """Get the local IP address of the machine."""
+# Utility functions for integration
+def setup_shard_manager(crawler):
+    """Set up the shard manager for a crawler."""
     try:
-        # Create a socket to determine the local IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except:
-        return "127.0.0.1"
+        shard_manager = ShardManager.from_crawler(crawler)
+        crawler.shard_manager = shard_manager
+        
+        # Add middleware
+        crawler.settings.set(
+            'DOWNLOADER_MIDDLEWARES',
+            {
+                'vex.distributed.shard_manager.DistributedSchedulerMiddleware': 100,
+                **crawler.settings.getdict('DOWNLOADER_MIDDLEWARES', {})
+            }
+        )
+        
+        return shard_manager
+    except NotConfigured:
+        return None
 
 
-# Configuration defaults
-SHARD_DEFAULTS = {
-    'SHARD_ENABLED': False,
-    'SHARD_HOST': get_local_ip(),
-    'SHARD_PORT': 6800,
-    'SHARD_SEED_NODES': [],
-    'SHARD_CHECKPOINT_INTERVAL': 60,
-    'SHARD_CHECKPOINT_PATH': None,
-    'SHARD_MANAGER_CLASS': 'vex.distributed.shard_manager.ShardManager',
-    'SCHEDULER': 'vex.distributed.shard_manager.DistributedScheduler',
-    'DUPEFILTER_CLASS': 'vex.dupefilters.RFPDupeFilter',
-}
+def get_shard_manager_stats(crawler) -> Optional[Dict[str, Any]]:
+    """Get statistics from the shard manager."""
+    if hasattr(crawler, 'shard_manager'):
+        return crawler.shard_manager.get_stats()
+    return None

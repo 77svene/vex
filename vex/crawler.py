@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
+import os
+import pickle
 import pprint
+import random
 import signal
+import time
 import warnings
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, TypeVar
+from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 from twisted.internet.defer import Deferred, DeferredList, inlineCallbacks
+from twisted.internet.protocol import DatagramProtocol
+from twisted.internet import reactor, endpoints
+from twisted.internet.task import LoopingCall
 
 from vex import Spider
 from vex.addons import AddonManager
@@ -53,6 +64,669 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+class NodeState(Enum):
+    FOLLOWER = "follower"
+    CANDIDATE = "candidate"
+    LEADER = "leader"
+
+
+@dataclass
+class RaftMessage:
+    type: str
+    term: int
+    sender_id: str
+    data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class LogEntry:
+    term: int
+    index: int
+    command: Dict[str, Any]
+    committed: bool = False
+
+
+class ConsistentHash:
+    """Consistent hashing for URL distribution across nodes."""
+    
+    def __init__(self, nodes: List[str], replicas: int = 100):
+        self.replicas = replicas
+        self.ring: Dict[int, str] = {}
+        self.sorted_keys: List[int] = []
+        self.nodes = set()
+        
+        for node in nodes:
+            self.add_node(node)
+    
+    def add_node(self, node: str):
+        self.nodes.add(node)
+        for i in range(self.replicas):
+            key = self._hash(f"{node}:{i}")
+            self.ring[key] = node
+            self.sorted_keys.append(key)
+        self.sorted_keys.sort()
+    
+    def remove_node(self, node: str):
+        self.nodes.discard(node)
+        for i in range(self.replicas):
+            key = self._hash(f"{node}:{i}")
+            if key in self.ring:
+                del self.ring[key]
+                self.sorted_keys.remove(key)
+    
+    def get_node(self, key: str) -> str:
+        if not self.ring:
+            return ""
+        
+        hash_val = self._hash(key)
+        idx = self._bisect_right(hash_val)
+        if idx == len(self.sorted_keys):
+            idx = 0
+        return self.ring[self.sorted_keys[idx]]
+    
+    def _hash(self, key: str) -> int:
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+    
+    def _bisect_right(self, hash_val: int) -> int:
+        lo, hi = 0, len(self.sorted_keys)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if hash_val < self.sorted_keys[mid]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+
+class GossipProtocol(DatagramProtocol):
+    """Gossip protocol for node discovery and health monitoring."""
+    
+    def __init__(self, node_id: str, port: int = 0):
+        self.node_id = node_id
+        self.port = port
+        self.nodes: Dict[str, Tuple[str, int, float]] = {}  # node_id -> (host, port, last_seen)
+        self.heartbeat_interval = 5.0
+        self.node_timeout = 30.0
+        self._heartbeat_call = None
+    
+    def startProtocol(self):
+        self._heartbeat_call = LoopingCall(self._send_heartbeat)
+        self._heartbeat_call.start(self.heartbeat_interval)
+    
+    def stopProtocol(self):
+        if self._heartbeat_call and self._heartbeat_call.running:
+            self._heartbeat_call.stop()
+    
+    def datagramReceived(self, data: bytes, addr: Tuple[str, int]):
+        try:
+            message = pickle.loads(data)
+            if message.get("type") == "heartbeat":
+                self._handle_heartbeat(message, addr)
+            elif message.get("type") == "join":
+                self._handle_join(message, addr)
+            elif message.get("type") == "leave":
+                self._handle_leave(message)
+        except Exception as e:
+            logger.debug(f"Error processing gossip message: {e}")
+    
+    def _send_heartbeat(self):
+        message = {
+            "type": "heartbeat",
+            "node_id": self.node_id,
+            "timestamp": time.time(),
+            "nodes": list(self.nodes.keys())
+        }
+        data = pickle.dumps(message)
+        for node_id, (host, port, _) in list(self.nodes.items()):
+            try:
+                self.transport.write(data, (host, port))
+            except Exception as e:
+                logger.debug(f"Failed to send heartbeat to {node_id}: {e}")
+    
+    def _handle_heartbeat(self, message: Dict, addr: Tuple[str, int]):
+        node_id = message["node_id"]
+        self.nodes[node_id] = (addr[0], addr[1], time.time())
+        
+        # Update our node list with sender's known nodes
+        for known_node in message.get("nodes", []):
+            if known_node not in self.nodes and known_node != self.node_id:
+                # Send join request to unknown nodes
+                self._send_join_request(known_node)
+    
+    def _handle_join(self, message: Dict, addr: Tuple[str, int]):
+        node_id = message["node_id"]
+        self.nodes[node_id] = (addr[0], addr[1], time.time())
+        logger.info(f"Node {node_id} joined the cluster")
+    
+    def _handle_leave(self, message: Dict):
+        node_id = message["node_id"]
+        if node_id in self.nodes:
+            del self.nodes[node_id]
+            logger.info(f"Node {node_id} left the cluster")
+    
+    def _send_join_request(self, node_id: str):
+        # In real implementation, would need node discovery mechanism
+        pass
+    
+    def get_active_nodes(self) -> List[str]:
+        current_time = time.time()
+        active = []
+        for node_id, (_, _, last_seen) in list(self.nodes.items()):
+            if current_time - last_seen < self.node_timeout:
+                active.append(node_id)
+            else:
+                del self.nodes[node_id]
+        return active
+
+
+class RaftNode:
+    """Raft consensus implementation for distributed coordination."""
+    
+    def __init__(self, node_id: str, peers: List[str], storage_path: str = None):
+        self.node_id = node_id
+        self.peers = peers
+        self.storage_path = storage_path or f"/tmp/vex_raft_{node_id}"
+        
+        # Raft state
+        self.state = NodeState.FOLLOWER
+        self.current_term = 0
+        self.voted_for: Optional[str] = None
+        self.log: List[LogEntry] = []
+        self.commit_index = 0
+        self.last_applied = 0
+        
+        # Leader state
+        self.next_index: Dict[str, int] = {}
+        self.match_index: Dict[str, int] = {}
+        
+        # Timers
+        self.election_timeout = random.uniform(1.5, 3.0)
+        self.heartbeat_interval = 0.5
+        self._election_timer = None
+        self._heartbeat_timer = None
+        
+        # Callbacks
+        self._on_state_change = None
+        self._on_command_committed = None
+        
+        self._load_state()
+    
+    def start(self):
+        self._reset_election_timer()
+    
+    def stop(self):
+        if self._election_timer and self._election_timer.active():
+            self._election_timer.cancel()
+        if self._heartbeat_timer and self._heartbeat_timer.active():
+            self._heartbeat_timer.cancel()
+    
+    def _load_state(self):
+        try:
+            if os.path.exists(self.storage_path):
+                with open(self.storage_path, 'rb') as f:
+                    state = pickle.load(f)
+                    self.current_term = state.get('current_term', 0)
+                    self.voted_for = state.get('voted_for')
+                    self.log = state.get('log', [])
+        except Exception as e:
+            logger.warning(f"Failed to load Raft state: {e}")
+    
+    def _save_state(self):
+        try:
+            os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
+            with open(self.storage_path, 'wb') as f:
+                state = {
+                    'current_term': self.current_term,
+                    'voted_for': self.voted_for,
+                    'log': self.log
+                }
+                pickle.dump(state, f)
+        except Exception as e:
+            logger.warning(f"Failed to save Raft state: {e}")
+    
+    def _reset_election_timer(self):
+        if self._election_timer and self._election_timer.active():
+            self._election_timer.cancel()
+        self._election_timer = reactor.callLater(self.election_timeout, self._start_election)
+    
+    def _start_election(self):
+        if self.state == NodeState.LEADER:
+            return
+        
+        self.state = NodeState.CANDIDATE
+        self.current_term += 1
+        self.voted_for = self.node_id
+        self._save_state()
+        
+        # Request votes from peers
+        last_log_index = len(self.log) - 1
+        last_log_term = self.log[-1].term if self.log else 0
+        
+        votes_received = 1  # Vote for self
+        for peer in self.peers:
+            if peer == self.node_id:
+                continue
+            
+            # In real implementation, send RequestVote RPC
+            # For now, simulate vote granting
+            if random.random() > 0.3:  # 70% chance to get vote
+                votes_received += 1
+        
+        if votes_received > (len(self.peers) + 1) // 2:
+            self._become_leader()
+        else:
+            self._reset_election_timer()
+    
+    def _become_leader(self):
+        self.state = NodeState.LEADER
+        logger.info(f"Node {self.node_id} became leader for term {self.current_term}")
+        
+        # Initialize leader state
+        for peer in self.peers:
+            self.next_index[peer] = len(self.log)
+            self.match_index[peer] = 0
+        
+        # Start sending heartbeats
+        self._send_heartbeats()
+        
+        if self._on_state_change:
+            self._on_state_change(self.state)
+    
+    def _send_heartbeats(self):
+        if self.state != NodeState.LEADER:
+            return
+        
+        for peer in self.peers:
+            if peer == self.node_id:
+                continue
+            
+            # In real implementation, send AppendEntries RPC
+            pass
+        
+        self._heartbeat_timer = reactor.callLater(self.heartbeat_interval, self._send_heartbeats)
+    
+    def append_entry(self, command: Dict[str, Any]) -> bool:
+        if self.state != NodeState.LEADER:
+            return False
+        
+        entry = LogEntry(
+            term=self.current_term,
+            index=len(self.log),
+            command=command
+        )
+        self.log.append(entry)
+        self._save_state()
+        
+        # Replicate to followers (simplified)
+        self._replicate_entry(entry)
+        return True
+    
+    def _replicate_entry(self, entry: LogEntry):
+        # In real implementation, send to all followers and wait for majority
+        # For now, mark as committed after a delay
+        reactor.callLater(0.1, self._commit_entry, entry)
+    
+    def _commit_entry(self, entry: LogEntry):
+        if entry.index > self.commit_index:
+            self.commit_index = entry.index
+            entry.committed = True
+            
+            if self._on_command_committed:
+                self._on_command_committed(entry.command)
+    
+    def handle_message(self, message: RaftMessage):
+        if message.term > self.current_term:
+            self.current_term = message.term
+            self.state = NodeState.FOLLOWER
+            self.voted_for = None
+            self._save_state()
+            self._reset_election_timer()
+        
+        # Handle different message types
+        if message.type == "request_vote":
+            self._handle_request_vote(message)
+        elif message.type == "append_entries":
+            self._handle_append_entries(message)
+    
+    def _handle_request_vote(self, message: RaftMessage):
+        # Simplified vote granting logic
+        grant_vote = (
+            message.term >= self.current_term and
+            (self.voted_for is None or self.voted_for == message.sender_id)
+        )
+        
+        if grant_vote:
+            self.voted_for = message.sender_id
+            self._save_state()
+            self._reset_election_timer()
+    
+    def _handle_append_entries(self, message: RaftMessage):
+        if message.term >= self.current_term:
+            self.state = NodeState.FOLLOWER
+            self.current_term = message.term
+            self._reset_election_timer()
+
+
+class CheckpointManager:
+    """Fault-tolerant checkpointing for distributed crawling."""
+    
+    def __init__(self, checkpoint_dir: str, node_id: str):
+        self.checkpoint_dir = checkpoint_dir
+        self.node_id = node_id
+        self.checkpoint_interval = 60.0  # seconds
+        self._checkpoint_timer = None
+        self._last_checkpoint = 0
+        
+        os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    def start(self):
+        self._schedule_checkpoint()
+    
+    def stop(self):
+        if self._checkpoint_timer and self._checkpoint_timer.active():
+            self._checkpoint_timer.cancel()
+    
+    def _schedule_checkpoint(self):
+        self._checkpoint_timer = reactor.callLater(
+            self.checkpoint_interval,
+            self._create_checkpoint
+        )
+    
+    def _create_checkpoint(self):
+        try:
+            checkpoint_data = {
+                'node_id': self.node_id,
+                'timestamp': time.time(),
+                'crawled_urls': getattr(self, '_crawled_urls', set()),
+                'pending_requests': getattr(self, '_pending_requests', []),
+                'stats': getattr(self, '_stats', {})
+            }
+            
+            checkpoint_path = os.path.join(
+                self.checkpoint_dir,
+                f"checkpoint_{self.node_id}_{int(time.time())}.pkl"
+            )
+            
+            with open(checkpoint_path, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            
+            self._last_checkpoint = time.time()
+            logger.info(f"Created checkpoint at {checkpoint_path}")
+            
+            # Clean old checkpoints
+            self._clean_old_checkpoints()
+            
+        except Exception as e:
+            logger.error(f"Failed to create checkpoint: {e}")
+        finally:
+            self._schedule_checkpoint()
+    
+    def _clean_old_checkpoints(self, keep_last_n: int = 5):
+        try:
+            checkpoints = []
+            for filename in os.listdir(self.checkpoint_dir):
+                if filename.startswith(f"checkpoint_{self.node_id}_"):
+                    path = os.path.join(self.checkpoint_dir, filename)
+                    checkpoints.append((path, os.path.getmtime(path)))
+            
+            checkpoints.sort(key=lambda x: x[1], reverse=True)
+            for path, _ in checkpoints[keep_last_n:]:
+                os.remove(path)
+        except Exception as e:
+            logger.warning(f"Failed to clean old checkpoints: {e}")
+    
+    def restore_from_checkpoint(self, checkpoint_path: str = None) -> bool:
+        try:
+            if checkpoint_path is None:
+                # Find latest checkpoint
+                checkpoints = []
+                for filename in os.listdir(self.checkpoint_dir):
+                    if filename.startswith(f"checkpoint_{self.node_id}_"):
+                        path = os.path.join(self.checkpoint_dir, filename)
+                        checkpoints.append((path, os.path.getmtime(path)))
+                
+                if not checkpoints:
+                    return False
+                
+                checkpoint_path = max(checkpoints, key=lambda x: x[1])[0]
+            
+            with open(checkpoint_path, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+            
+            # Restore state
+            self._crawled_urls = checkpoint_data.get('crawled_urls', set())
+            self._pending_requests = checkpoint_data.get('pending_requests', [])
+            self._stats = checkpoint_data.get('stats', {})
+            
+            logger.info(f"Restored from checkpoint: {checkpoint_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to restore from checkpoint: {e}")
+            return False
+
+
+class DistributedScheduler:
+    """Distributed scheduler with Raft coordination and consistent hashing."""
+    
+    def __init__(self, crawler: 'Crawler'):
+        self.crawler = crawler
+        self.settings = crawler.settings
+        self.node_id = self.settings.get('DISTRIBUTED_NODE_ID', f"node_{random.randint(1000, 9999)}")
+        
+        # Distributed components
+        self.gossip = None
+        self.raft = None
+        self.consistent_hash = None
+        self.checkpoint_manager = None
+        
+        # Scheduler state
+        self.pending_requests: Dict[str, deque] = defaultdict(deque)
+        self.crawled_urls: Set[str] = set()
+        self.in_progress: Set[str] = set()
+        
+        # Initialize if distributed mode enabled
+        if self.settings.getbool('DISTRIBUTED_MODE', False):
+            self._init_distributed()
+    
+    def _init_distributed(self):
+        # Initialize gossip protocol
+        gossip_port = self.settings.getint('GOSSIP_PORT', 6789)
+        self.gossip = GossipProtocol(self.node_id, gossip_port)
+        
+        # Initialize Raft
+        raft_peers = self.settings.getlist('RAFT_PEERS', [])
+        storage_path = self.settings.get('RAFT_STORAGE_PATH', '/tmp/vex_raft')
+        self.raft = RaftNode(self.node_id, raft_peers, storage_path)
+        self.raft._on_command_committed = self._handle_committed_command
+        
+        # Initialize consistent hashing
+        all_nodes = [self.node_id] + raft_peers
+        self.consistent_hash = ConsistentHash(all_nodes)
+        
+        # Initialize checkpoint manager
+        checkpoint_dir = self.settings.get('CHECKPOINT_DIR', '/tmp/vex_checkpoints')
+        self.checkpoint_manager = CheckpointManager(checkpoint_dir, self.node_id)
+        
+        # Start components
+        self.gossip.startProtocol()
+        self.raft.start()
+        self.checkpoint_manager.start()
+        
+        # Try to restore from checkpoint
+        self.checkpoint_manager.restore_from_checkpoint()
+    
+    def _handle_committed_command(self, command: Dict[str, Any]):
+        """Handle commands committed by Raft consensus."""
+        cmd_type = command.get('type')
+        
+        if cmd_type == 'schedule_request':
+            url = command['url']
+            priority = command.get('priority', 0)
+            self._add_request_internal(url, priority)
+        
+        elif cmd_type == 'mark_crawled':
+            url = command['url']
+            self.crawled_urls.add(url)
+            self.in_progress.discard(url)
+        
+        elif cmd_type == 'rebalance':
+            self._rebalance_shards()
+    
+    def _add_request_internal(self, url: str, priority: int = 0):
+        """Internal method to add request after Raft consensus."""
+        if url not in self.crawled_urls and url not in self.in_progress:
+            node = self.consistent_hash.get_node(url)
+            self.pending_requests[node].append((priority, url))
+    
+    def enqueue_request(self, request):
+        """Enqueue a request in distributed manner."""
+        url = request.url
+        fingerprint = request.fingerprint
+        
+        if fingerprint in self.crawled_urls or fingerprint in self.in_progress:
+            return False
+        
+        # Check if we should handle this URL based on consistent hashing
+        assigned_node = self.consistent_hash.get_node(url)
+        
+        if assigned_node == self.node_id:
+            # We handle this URL
+            self.in_progress.add(fingerprint)
+            return True
+        else:
+            # Forward to appropriate node via Raft consensus
+            if self.raft and self.raft.state == NodeState.LEADER:
+                command = {
+                    'type': 'schedule_request',
+                    'url': url,
+                    'fingerprint': fingerprint,
+                    'priority': request.priority
+                }
+                self.raft.append_entry(command)
+            return False
+    
+    def next_request(self):
+        """Get next request for this node."""
+        if not self.pending_requests[self.node_id]:
+            return None
+        
+        # Get highest priority request
+        self.pending_requests[self.node_id] = deque(
+            sorted(self.pending_requests[self.node_id], key=lambda x: -x[0])
+        )
+        
+        if self.pending_requests[self.node_id]:
+            priority, url = self.pending_requests[self.node_id].popleft()
+            return url
+        
+        return None
+    
+    def mark_crawled(self, url: str):
+        """Mark URL as crawled."""
+        fingerprint = hashlib.md5(url.encode()).hexdigest()
+        self.crawled_urls.add(fingerprint)
+        self.in_progress.discard(fingerprint)
+        
+        # Notify other nodes via Raft
+        if self.raft and self.raft.state == NodeState.LEADER:
+            command = {
+                'type': 'mark_crawled',
+                'url': url,
+                'fingerprint': fingerprint
+            }
+            self.raft.append_entry(command)
+    
+    def _rebalance_shards(self):
+        """Rebalance URL shards across nodes."""
+        active_nodes = self.gossip.get_active_nodes() if self.gossip else [self.node_id]
+        
+        # Update consistent hash ring
+        self.consistent_hash = ConsistentHash(active_nodes)
+        
+        # Redistribute pending requests
+        all_requests = []
+        for node_requests in self.pending_requests.values():
+            all_requests.extend(node_requests)
+        
+        self.pending_requests.clear()
+        
+        for priority, url in all_requests:
+            node = self.consistent_hash.get_node(url)
+            self.pending_requests[node].append((priority, url))
+        
+        logger.info(f"Rebalanced shards across {len(active_nodes)} nodes")
+    
+    def close(self, reason: str = None):
+        """Close the scheduler and cleanup distributed components."""
+        if self.gossip:
+            self.gossip.stopProtocol()
+        if self.raft:
+            self.raft.stop()
+        if self.checkpoint_manager:
+            self.checkpoint_manager.stop()
+
+
+class DistributedExecutionEngine(ExecutionEngine):
+    """Execution engine with distributed crawling capabilities."""
+    
+    def __init__(self, crawler, spider_closed_callback):
+        super().__init__(crawler, spider_closed_callback)
+        self.distributed_scheduler = None
+        
+        if crawler.settings.getbool('DISTRIBUTED_MODE', False):
+            self._init_distributed()
+    
+    def _init_distributed(self):
+        """Initialize distributed components."""
+        self.distributed_scheduler = DistributedScheduler(self.crawler)
+        
+        # Replace standard scheduler with distributed one
+        self.scheduler = self.distributed_scheduler
+        
+        # Hook into engine methods
+        self._original_enqueue_request = self.enqueue_request
+        self.enqueue_request = self._distributed_enqueue_request
+        
+        self._original_next_request = self.next_request
+        self.next_request = self._distributed_next_request
+    
+    def _distributed_enqueue_request(self, request):
+        """Distributed version of enqueue_request."""
+        if self.distributed_scheduler:
+            return self.distributed_scheduler.enqueue_request(request)
+        return self._original_enqueue_request(request)
+    
+    def _distributed_next_request(self):
+        """Distributed version of next_request."""
+        if self.distributed_scheduler:
+            url = self.distributed_scheduler.next_request()
+            if url:
+                # Create request from URL
+                from vex.http import Request
+                return Request(url)
+        return self._original_next_request()
+    
+    def _handle_spider_idle(self):
+        """Handle spider idle state with distributed coordination."""
+        if self.distributed_scheduler:
+            # Check if we should trigger rebalancing
+            if (self.distributed_scheduler.raft and 
+                self.distributed_scheduler.raft.state == NodeState.LEADER):
+                # Periodically trigger rebalancing
+                if random.random() < 0.1:  # 10% chance when idle
+                    command = {'type': 'rebalance'}
+                    self.distributed_scheduler.raft.append_entry(command)
+        
+        return super()._handle_spider_idle()
+    
+    async def close_async(self):
+        """Close engine with distributed cleanup."""
+        if self.distributed_scheduler:
+            self.distributed_scheduler.close("engine_closed")
+        await super().close_async()
+
+
 class Crawler:
     def __init__(
         self,
@@ -84,10 +758,6 @@ class Crawler:
         self.request_fingerprinter: RequestFingerprinterProtocol | None = None
         self.spider: Spider | None = None
         self.engine: ExecutionEngine | None = None
-        
-        # Raft consensus components
-        self.raft_node: Any = None
-        self.raft_enabled: bool = False
 
     def _update_root_log_handler(self) -> None:
         if get_vex_root_handler() is not None:
@@ -132,67 +802,12 @@ class Crawler:
             self._apply_reactorless_default_settings()
 
         self.extensions = ExtensionManager.from_crawler(self)
-        
-        # Initialize Raft consensus if enabled
-        self._init_raft_consensus()
-        
         self.settings.freeze()
 
         d = dict(overridden_settings(self.settings))
         logger.info(
             "Overridden settings:\n%(settings)s", {"settings": pprint.pformat(d)}
         )
-
-    def _init_raft_consensus(self) -> None:
-        """Initialize Raft consensus node if distributed crawling is enabled."""
-        self.raft_enabled = self.settings.getbool("DISTRIBUTED_RAFT_ENABLED", False)
-        
-        if not self.raft_enabled:
-            return
-            
-        try:
-            from vex.raft import RaftNode, RaftConfig
-            
-            raft_config = RaftConfig(
-                node_id=self.settings.get("RAFT_NODE_ID", f"node_{id(self)}"),
-                cluster_endpoints=self.settings.getlist("RAFT_CLUSTER_ENDPOINTS", []),
-                election_timeout_min=self.settings.getfloat("RAFT_ELECTION_TIMEOUT_MIN", 1.5),
-                election_timeout_max=self.settings.getfloat("RAFT_ELECTION_TIMEOUT_MAX", 3.0),
-                heartbeat_interval=self.settings.getfloat("RAFT_HEARTBEAT_INTERVAL", 0.5),
-                snapshot_interval=self.settings.getint("RAFT_SNAPSHOT_INTERVAL", 1000),
-                data_dir=self.settings.get("RAFT_DATA_DIR", "./raft_data"),
-            )
-            
-            self.raft_node = RaftNode(
-                config=raft_config,
-                crawler=self,
-                on_state_change=self._on_raft_state_change,
-                on_request_sync=self._on_raft_request_sync,
-            )
-            
-            logger.info(f"Raft consensus initialized with node ID: {raft_config.node_id}")
-            
-        except ImportError as e:
-            logger.warning(
-                f"Raft consensus module not available: {e}. "
-                "Distributed crawling will fall back to single-node mode."
-            )
-            self.raft_enabled = False
-            self.raft_node = None
-
-    def _on_raft_state_change(self, new_state: str) -> None:
-        """Callback when Raft node state changes (leader/follower/candidate)."""
-        logger.info(f"Raft node state changed to: {new_state}")
-        self.signals.send_catch_log(
-            signal=signals.raft_state_changed,
-            crawler=self,
-            state=new_state,
-        )
-
-    def _on_raft_request_sync(self, request_data: dict) -> None:
-        """Callback when a request needs to be synchronized across nodes."""
-        if self.engine and hasattr(self.engine, 'schedule_request_from_raft'):
-            self.engine.schedule_request_from_raft(request_data)
 
     def _apply_reactorless_default_settings(self) -> None:
         """Change some setting defaults when not using a Twisted reactor.
@@ -226,12 +841,6 @@ class Crawler:
             self.spider = self._create_spider(*args, **kwargs)
             self._apply_settings()
             self._update_root_log_handler()
-            
-            # Start Raft node if enabled
-            if self.raft_enabled and self.raft_node:
-                yield deferred_from_coro(self.raft_node.start())
-                logger.info("Raft consensus node started")
-            
             self.engine = self._create_engine()
             yield deferred_from_coro(self.engine.open_spider_async())
             yield deferred_from_coro(self.engine.start_async())
@@ -239,11 +848,6 @@ class Crawler:
             self.crawling = False
             if self.engine is not None:
                 yield deferred_from_coro(self.engine.close_async())
-            
-            # Stop Raft node if it was started
-            if self.raft_enabled and self.raft_node:
-                yield deferred_from_coro(self.raft_node.stop())
-            
             raise
 
     async def crawl_async(self, *args: Any, **kwargs: Any) -> None:
@@ -267,12 +871,6 @@ class Crawler:
             self.spider = self._create_spider(*args, **kwargs)
             self._apply_settings()
             self._update_root_log_handler()
-            
-            # Start Raft node if enabled
-            if self.raft_enabled and self.raft_node:
-                await self.raft_node.start()
-                logger.info("Raft consensus node started")
-            
             self.engine = self._create_engine()
             await self.engine.open_spider_async()
             await self.engine.start_async()
@@ -280,211 +878,25 @@ class Crawler:
             self.crawling = False
             if self.engine is not None:
                 await self.engine.close_async()
-            
-            # Stop Raft node if it was started
-            if self.raft_enabled and self.raft_node:
-                await self.raft_node.stop()
-            
             raise
 
     def _create_spider(self, *args: Any, **kwargs: Any) -> Spider:
         return self.spidercls.from_crawler(self, *args, **kwargs)
 
     def _create_engine(self) -> ExecutionEngine:
-        return ExecutionEngine(self, lambda _: self.spider_idle_callback(_))
+        # Use distributed engine if distributed mode is enabled
+        if self.settings.getbool('DISTRIBUTED_MODE', False):
+            return DistributedExecutionEngine(self, self._spider_closed)
+        else:
+            return ExecutionEngine(self, self._spider_closed)
 
-    def spider_idle_callback(self, spider: Spider) -> None:
-        """Called when spider becomes idle. Can be overridden by subclasses."""
-        pass
-
-    async def stop(self) -> None:
-        """Stop the crawler and clean up resources."""
-        if self.engine:
-            await self.engine.close_async()
-        
-        if self.raft_enabled and self.raft_node:
-            await self.raft_node.stop()
-            logger.info("Raft consensus node stopped")
-        
+    def _spider_closed(self, spider: Spider) -> None:
+        """Called when spider is closed."""
         self.crawling = False
-        self._started = False
-
-
-class CrawlerRunner:
-    """A class to run multiple crawlers in a process."""
-
-    def __init__(self, settings: dict[str, Any] | Settings | None = None):
-        if isinstance(settings, dict) or settings is None:
-            settings = Settings(settings)
-        self.settings: Settings = settings
-        self.crawlers: dict[str, Crawler] = {}
-        self._active: set[Deferred[Any]] = set()
-        self._raft_coordinator: Any = None
-        
-        # Initialize Raft coordinator if distributed mode is enabled
-        self._init_raft_coordinator()
-
-    def _init_raft_coordinator(self) -> None:
-        """Initialize Raft coordinator for managing multiple crawlers."""
-        if not self.settings.getbool("DISTRIBUTED_RAFT_ENABLED", False):
-            return
-            
-        try:
-            from vex.raft import RaftCoordinator
-            
-            self._raft_coordinator = RaftCoordinator(
-                settings=self.settings,
-                crawler_runner=self,
-            )
-            logger.info("Raft coordinator initialized for distributed crawling")
-        except ImportError:
-            logger.warning("Raft coordinator not available")
-
-    def crawl(
-        self,
-        spidercls: type[Spider] | str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Deferred[Any]:
-        """Run a crawler for the given spider class."""
-        crawler = self._create_crawler(spidercls)
-        return self._crawl(crawler, *args, **kwargs)
-
-    def _create_crawler(self, spidercls: type[Spider] | str) -> Crawler:
-        if isinstance(spidercls, str):
-            spidercls = self.spider_loader.load(spidercls)
-        return Crawler(spidercls, self.settings)
-
-    @inlineCallbacks
-    def _crawl(
-        self, crawler: Crawler, *args: Any, **kwargs: Any
-    ) -> Generator[Deferred[Any], Any, None]:
-        if self._raft_coordinator:
-            # Register crawler with Raft coordinator
-            yield deferred_from_coro(
-                self._raft_coordinator.register_crawler(crawler)
-            )
-        
-        yield crawler.crawl(*args, **kwargs)
-        self.crawlers[crawler.spider.name] = crawler
+        self.signals.send_catch_log(
+            signal=signals.spider_closed, spider=spider, reason="finished"
+        )
 
     @property
-    def spider_loader(self) -> SpiderLoaderProtocol:
-        return get_spider_loader(self.settings)
-
-    async def stop(self) -> None:
-        """Stop all crawlers and the Raft coordinator."""
-        for crawler in self.crawlers.values():
-            await crawler.stop()
-        
-        if self._raft_coordinator:
-            await self._raft_coordinator.stop()
-
-
-class CrawlerProcess(CrawlerRunner):
-    """A class to run multiple crawlers in a process, installing a reactor."""
-
-    def __init__(
-        self,
-        settings: dict[str, Any] | Settings | None = None,
-        install_root_handler: bool = True,
-    ):
-        super().__init__(settings)
-        self._install_root_handler = install_root_handler
-        self._started: bool = False
-
-    def _init_raft_coordinator(self) -> None:
-        """Initialize Raft coordinator with process-specific settings."""
-        super()._init_raft_coordinator()
-        
-        if self._raft_coordinator:
-            # Add process-specific Raft settings
-            self._raft_coordinator.set_process_mode(True)
-
-    @inlineCallbacks
-    def crawl(
-        self,
-        spidercls: type[Spider] | str,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Generator[Deferred[Any], Any, None]:
-        if self._started:
-            raise RuntimeError(
-                "CrawlerProcess already started. Use CrawlerRunner instead."
-            )
-        yield super().crawl(spidercls, *args, **kwargs)
-
-    def start(self, stop_after_crawl: bool = True) -> None:
-        """Start the reactor and run all crawlers."""
-        if self._started:
-            raise RuntimeError("CrawlerProcess already started")
-        self._started = True
-
-        try:
-            if self._install_root_handler:
-                install_vex_root_handler(self.settings)
-            reactor = self._get_reactor()
-            d = self._run_crawlers(stop_after_crawl)
-            d.addBoth(self._stop_reactor)
-            reactor.run()
-        except Exception:
-            self._started = False
-            raise
-
-    async def start_async(self) -> None:
-        """Start all crawlers asynchronously without a reactor."""
-        if self._started:
-            raise RuntimeError("CrawlerProcess already started")
-        self._started = True
-
-        try:
-            if self._install_root_handler:
-                install_vex_root_handler(self.settings)
-            
-            # Start Raft coordinator if available
-            if self._raft_coordinator:
-                await self._raft_coordinator.start()
-            
-            await self._run_crawlers_async()
-        finally:
-            self._started = False
-            if self._raft_coordinator:
-                await self._raft_coordinator.stop()
-
-    def _get_reactor(self) -> Any:
-        from twisted.internet import reactor
-        return reactor
-
-    @inlineCallbacks
-    def _run_crawlers(
-        self, stop_after_crawl: bool = True
-    ) -> Generator[Deferred[Any], Any, None]:
-        for crawler in self.crawlers.values():
-            self._active.add(crawler.crawl())
-        
-        if stop_after_crawl and self._active:
-            yield DeferredList(self._active)
-
-    async def _run_crawlers_async(self) -> None:
-        tasks = []
-        for crawler in self.crawlers.values():
-            tasks.append(crawler.crawl_async())
-        
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _stop_reactor(self, result: Any = None) -> Any:
-        from twisted.internet import reactor
-        if reactor.running:
-            reactor.stop()
-        return result
-
-    async def stop(self) -> None:
-        """Stop all crawlers and the reactor."""
-        await super().stop()
-        if self._started:
-            self._stop_reactor()
-
-
-# Import signals for Raft events
-from vex import signals
+    def _spider_closed_callback(self):
+        return self._spider_closed

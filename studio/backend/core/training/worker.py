@@ -2,11 +2,13 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 """
-Distributed training worker with Celery and Redis.
+Training subprocess entry point.
 
-Replaces the multiprocessing-based job system with Redis-backed Celery for
-distributed task processing. Enables horizontal scaling, job prioritization,
-retry mechanisms, and real-time progress tracking across multiple workers.
+Each training job runs in a fresh subprocess (mp.get_context("spawn")).
+This gives us a clean Python interpreter with no stale module state —
+solving the transformers version-switching problem completely.
+
+Pattern follows core/data_recipe/jobs/worker.py.
 """
 
 from __future__ import annotations
@@ -18,145 +20,385 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Union
+from typing import Any, Dict, List, Optional, Type
+import importlib
+import importlib.util
+import hashlib
 import json
-import redis
-from celery import Celery, Task
-from celery.signals import task_prerun, task_postrun, task_failure
-from kombu import Exchange, Queue
-import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-import numpy as np
-import socket
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
 
 logger = get_logger(__name__)
 
-# ── Celery Configuration ──────────────────────────────────────────────────────
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
 
-# Create Celery app
-celery_app = Celery(
-    "vex_training",
-    broker=CELERY_BROKER_URL,
-    backend=CELERY_RESULT_BACKEND,
-    include=["core.training.worker"],
-)
-
-# Configure Celery
-celery_app.conf.update(
-    task_serializer="json",
-    accept_content=["json"],
-    result_serializer="json",
-    timezone="UTC",
-    enable_utc=True,
-    task_track_started=True,
-    task_time_limit=3600 * 24,  # 24 hours max per task
-    task_soft_time_limit=3600 * 23,  # 23 hours soft limit
-    worker_prefetch_multiplier=1,  # Don't prefetch tasks for better prioritization
-    worker_max_tasks_per_child=100,  # Restart worker after 100 tasks to prevent memory leaks
-    task_acks_late=True,  # Only acknowledge after task completes
-    task_reject_on_worker_lost=True,  # Requeue if worker dies
-    task_default_queue="default",
-    task_queues=(
-        Queue("default", Exchange("default"), routing_key="default"),
-        Queue("high_priority", Exchange("high_priority"), routing_key="high_priority"),
-        Queue("low_priority", Exchange("low_priority"), routing_key="low_priority"),
-    ),
-    task_routes={
-        "core.training.worker.run_training_task": {"queue": "default"},
-        "core.training.worker.run_data_recipe_task": {"queue": "default"},
-    },
-    # Retry configuration
-    task_annotations={
-        "core.training.worker.run_training_task": {
-            "rate_limit": "10/m",  # Max 10 training tasks per minute
-            "default_retry_delay": 30,
-            "max_retries": 3,
-            "autoretry_for": (Exception,),
-            "retry_backoff": True,
-            "retry_backoff_max": 600,
-            "retry_jitter": True,
-        }
-    },
-)
-
-# Redis client for progress tracking
-redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+@dataclass
+class PluginMetadata:
+    """Metadata for a loaded plugin."""
+    name: str
+    version: str
+    author: str
+    description: str
+    plugin_type: str  # "training", "quantization", "kernel", "data_processing"
+    entry_point: str
+    hash: str
+    loaded_at: datetime
+    compatibility_version: str = "1.0.0"
 
 
-class ProgressTask(Task):
-    """Base task class with progress tracking capabilities."""
+class PluginInterface(ABC):
+    """Base interface all plugins must implement."""
     
-    abstract = True
+    @abstractmethod
+    def get_metadata(self) -> PluginMetadata:
+        """Return plugin metadata."""
+        pass
     
-    def update_progress(self, task_id: str, progress: float, status: str, metadata: Optional[Dict] = None):
-        """Update task progress in Redis for real-time tracking."""
-        progress_data = {
-            "task_id": task_id,
-            "progress": min(max(progress, 0.0), 1.0),  # Clamp between 0 and 1
-            "status": status,
-            "timestamp": time.time(),
-            "metadata": metadata or {},
+    @abstractmethod
+    def validate_compatibility(self, worker_version: str) -> bool:
+        """Check if plugin is compatible with current worker version."""
+        pass
+
+
+class TrainingLoopPlugin(PluginInterface):
+    """Interface for custom training loop plugins."""
+    
+    @abstractmethod
+    def create_trainer(self, config: Dict[str, Any], **kwargs) -> Any:
+        """Create a trainer instance with custom training loop."""
+        pass
+    
+    @abstractmethod
+    def get_supported_algorithms(self) -> List[str]:
+        """Return list of supported training algorithms."""
+        pass
+
+
+class QuantizationPlugin(PluginInterface):
+    """Interface for custom quantization method plugins."""
+    
+    @abstractmethod
+    def quantize_model(self, model: Any, config: Dict[str, Any]) -> Any:
+        """Apply quantization to a model."""
+        pass
+    
+    @abstractmethod
+    def get_supported_formats(self) -> List[str]:
+        """Return list of supported quantization formats."""
+        pass
+
+
+class CUDAPlugin(PluginInterface):
+    """Interface for custom CUDA kernel plugins."""
+    
+    @abstractmethod
+    def get_kernel_module(self) -> Any:
+        """Return the compiled CUDA kernel module."""
+        pass
+    
+    @abstractmethod
+    def get_kernel_functions(self) -> Dict[str, Any]:
+        """Return mapping of kernel names to functions."""
+        pass
+
+
+class DataProcessingPlugin(PluginInterface):
+    """Interface for data processing plugins."""
+    
+    @abstractmethod
+    def process_dataset(self, dataset: Any, config: Dict[str, Any]) -> Any:
+        """Process a dataset with custom logic."""
+        pass
+
+
+class PluginSandbox:
+    """Sandboxed environment for loading plugins with restricted globals."""
+    
+    def __init__(self):
+        self.safe_builtins = {
+            'None': None,
+            'False': False,
+            'True': True,
+            'bool': bool,
+            'int': int,
+            'float': float,
+            'str': str,
+            'list': list,
+            'dict': dict,
+            'set': set,
+            'tuple': tuple,
+            'bytes': bytes,
+            'bytearray': bytearray,
+            'range': range,
+            'slice': slice,
+            'property': property,
+            'staticmethod': staticmethod,
+            'classmethod': classmethod,
+            'super': super,
+            'object': object,
+            'type': type,
+            'isinstance': isinstance,
+            'issubclass': issubclass,
+            'len': len,
+            'enumerate': enumerate,
+            'zip': zip,
+            'map': map,
+            'filter': filter,
+            'sorted': sorted,
+            'reversed': reversed,
+            'any': any,
+            'all': all,
+            'min': min,
+            'max': max,
+            'sum': sum,
+            'abs': abs,
+            'round': round,
+            'pow': pow,
+            'hash': hash,
+            'id': id,
+            'repr': repr,
+            'ascii': ascii,
+            'ord': ord,
+            'chr': chr,
+            'bin': bin,
+            'oct': oct,
+            'hex': hex,
+            'format': format,
+            'vars': vars,
+            'dir': dir,
+            'callable': callable,
+            'hasattr': hasattr,
+            'getattr': getattr,
+            'setattr': setattr,
+            'delattr': delattr,
         }
         
-        # Store in Redis with 24-hour expiry
-        redis_key = f"task_progress:{task_id}"
-        redis_client.setex(redis_key, 86400, json.dumps(progress_data))
-        
-        # Also publish to channel for real-time updates
-        redis_client.publish(f"task_updates:{task_id}", json.dumps(progress_data))
-        
-        # Update Celery task state
-        self.update_state(
-            state="PROGRESS",
-            meta=progress_data,
-        )
-        
-        logger.info("Task %s progress: %.1f%% - %s", task_id, progress * 100, status)
+        self.restricted_modules = {
+            'os': {'path': os.path, 'environ': os.environ},
+            'sys': {'platform': sys.platform, 'version': sys.version},
+            'pathlib': {'Path': Path},
+            'typing': {},
+            'abc': {'ABC': ABC, 'abstractmethod': abstractmethod},
+            'dataclasses': {'dataclass': dataclass},
+            'datetime': {'datetime': datetime},
+        }
     
-    def on_failure(self, exc, task_id, args, kwargs, einfo):
-        """Handle task failure."""
-        error_data = {
-            "task_id": task_id,
-            "error": str(exc),
-            "traceback": str(einfo),
-            "timestamp": time.time(),
+    def create_restricted_globals(self) -> Dict[str, Any]:
+        """Create restricted globals dictionary for plugin execution."""
+        restricted_globals = {
+            '__builtins__': self.safe_builtins,
+            '__name__': '__main__',
+            '__doc__': None,
         }
         
-        # Store error in Redis
-        redis_key = f"task_error:{task_id}"
-        redis_client.setex(redis_key, 86400, json.dumps(error_data))
+        # Add restricted module access
+        for mod_name, allowed_attrs in self.restricted_modules.items():
+            try:
+                mod = importlib.import_module(mod_name)
+                restricted_globals[mod_name] = type('RestrictedModule', (), {
+                    attr: getattr(mod, attr) for attr in allowed_attrs 
+                    if hasattr(mod, attr)
+                })()
+            except ImportError:
+                continue
         
-        # Publish error
-        redis_client.publish(f"task_updates:{task_id}", json.dumps({
-            "type": "error",
-            **error_data,
-        }))
-        
-        logger.error("Task %s failed: %s", task_id, exc)
+        return restricted_globals
+
+
+class PluginRegistry:
+    """Registry for managing loaded plugins with hot-reloading support."""
     
-    def on_success(self, retval, task_id, args, kwargs):
-        """Handle task success."""
-        completion_data = {
-            "task_id": task_id,
-            "result": retval,
-            "timestamp": time.time(),
-        }
+    def __init__(self, plugin_dirs: List[Path]):
+        self.plugin_dirs = plugin_dirs
+        self.plugins: Dict[str, PluginInterface] = {}
+        self.metadata: Dict[str, PluginMetadata] = {}
+        self.file_hashes: Dict[str, str] = {}
+        self.sandbox = PluginSandbox()
+        self.worker_version = "1.0.0"  # Should come from config
         
-        # Store completion in Redis
-        redis_key = f"task_complete:{task_id}"
-        redis_client.setex(redis_key, 86400, json.dumps(completion_data))
+    def _calculate_file_hash(self, file_path: Path) -> str:
+        """Calculate SHA256 hash of a plugin file."""
+        with open(file_path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    
+    def _load_plugin_module(self, plugin_path: Path) -> Optional[Any]:
+        """Load a plugin module in a sandboxed environment."""
+        try:
+            module_name = f"vex_plugin_{plugin_path.stem}"
+            spec = importlib.util.spec_from_file_location(
+                module_name, 
+                plugin_path,
+                submodule_search_locations=[]
+            )
+            
+            if spec is None or spec.loader is None:
+                logger.error("Failed to create module spec for %s", plugin_path)
+                return None
+            
+            module = importlib.util.module_from_spec(spec)
+            
+            # Execute in restricted environment
+            restricted_globals = self.sandbox.create_restricted_globals()
+            restricted_globals['__file__'] = str(plugin_path)
+            
+            # Read and compile source with restrictions
+            with open(plugin_path, 'r') as f:
+                source = f.read()
+            
+            code = compile(source, str(plugin_path), 'exec')
+            exec(code, restricted_globals)
+            
+            # Copy allowed attributes to module
+            for key, value in restricted_globals.items():
+                if not key.startswith('__') and key not in ['__builtins__']:
+                    setattr(module, key, value)
+            
+            return module
+            
+        except Exception as e:
+            logger.error("Failed to load plugin %s: %s", plugin_path, e)
+            logger.debug(traceback.format_exc())
+            return None
+    
+    def _discover_plugins(self) -> List[Path]:
+        """Discover all plugin files in configured directories."""
+        plugin_files = []
         
-        # Publish completion
-        redis_client.publish(f"task_updates:{task_id}", json.dumps({
-            "type": "complete",
-            **completion_data,
-        }))
+        for plugin_dir in self.plugin_dirs:
+            if not plugin_dir.exists():
+                logger.warning("Plugin directory does not exist: %s", plugin_dir)
+                continue
+            
+            # Look for .py files and packages
+            for item in plugin_dir.iterdir():
+                if item.is_file() and item.suffix == '.py':
+                    plugin_files.append(item)
+                elif item.is_dir() and (item / '__init__.py').exists():
+                    plugin_files.append(item / '__init__.py')
         
-        logger.info("Task %s completed successfully", task_id)
+        return plugin_files
+    
+    def _validate_plugin_interface(self, plugin_obj: Any) -> bool:
+        """Validate that plugin implements required interface."""
+        required_methods = ['get_metadata', 'validate_compatibility']
+        
+        for method in required_methods:
+            if not hasattr(plugin_obj, method) or not callable(getattr(plugin_obj, method)):
+                return False
+        
+        # Check for plugin type specific methods
+        if isinstance(plugin_obj, TrainingLoopPlugin):
+            if not hasattr(plugin_obj, 'create_trainer'):
+                return False
+        elif isinstance(plugin_obj, QuantizationPlugin):
+            if not hasattr(plugin_obj, 'quantize_model'):
+                return False
+        elif isinstance(plugin_obj, CUDAPlugin):
+            if not hasattr(plugin_obj, 'get_kernel_module'):
+                return False
+        elif isinstance(plugin_obj, DataProcessingPlugin):
+            if not hasattr(plugin_obj, 'process_dataset'):
+                return False
+        else:
+            return False
+        
+        return True
+    
+    def load_plugin(self, plugin_path: Path) -> bool:
+        """Load a single plugin from file path."""
+        try:
+            # Check if plugin has changed
+            current_hash = self._calculate_file_hash(plugin_path)
+            if plugin_path in self.file_hashes and self.file_hashes[plugin_path] == current_hash:
+                logger.debug("Plugin %s unchanged, skipping reload", plugin_path)
+                return True
+            
+            # Load module
+            module = self._load_plugin_module(plugin_path)
+            if module is None:
+                return False
+            
+            # Find plugin class in module
+            plugin_class = None
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if (isinstance(attr, type) and 
+                    issubclass(attr, PluginInterface) and 
+                    attr is not PluginInterface):
+                    plugin_class = attr
+                    break
+            
+            if plugin_class is None:
+                logger.error("No plugin class found in %s", plugin_path)
+                return False
+            
+            # Instantiate plugin
+            plugin_instance = plugin_class()
+            
+            # Validate interface
+            if not self._validate_plugin_interface(plugin_instance):
+                logger.error("Plugin %s does not implement required interface", plugin_path)
+                return False
+            
+            # Get metadata
+            metadata = plugin_instance.get_metadata()
+            
+            # Check compatibility
+            if not plugin_instance.validate_compatibility(self.worker_version):
+                logger.error("Plugin %s is not compatible with worker version %s", 
+                           metadata.name, self.worker_version)
+                return False
+            
+            # Register plugin
+            plugin_key = f"{metadata.plugin_type}:{metadata.name}"
+            self.plugins[plugin_key] = plugin_instance
+            self.metadata[plugin_key] = metadata
+            self.file_hashes[plugin_path] = current_hash
+            
+            logger.info("Loaded plugin: %s v%s by %s", 
+                       metadata.name, metadata.version, metadata.author)
+            
+            return True
+            
+        except Exception as e:
+            logger.error("Failed to load plugin from %s: %s", plugin_path, e)
+            logger.debug(traceback.format_exc())
+            return False
+    
+    def load_all_plugins(self) -> None:
+        """Load all discovered plugins."""
+        plugin_files = self._discover_plugins()
+        logger.info("Discovered %d potential plugin files", len(plugin_files))
+        
+        loaded_count = 0
+        for plugin_path in plugin_files:
+            if self.load_plugin(plugin_path):
+                loaded_count += 1
+        
+        logger.info("Successfully loaded %d/%d plugins", loaded_count, len(plugin_files))
+    
+    def reload_plugins(self) -> None:
+        """Reload all plugins (hot-reload)."""
+        logger.info("Hot-reloading plugins...")
+        
+        # Clear existing plugins
+        self.plugins.clear()
+        self.metadata.clear()
+        
+        # Reload all
+        self.load_all_plugins()
+    
+    def get_plugins_by_type(self, plugin_type: str) -> List[PluginInterface]:
+        """Get all plugins of specified type."""
+        return [
+            plugin for key, plugin in self.plugins.items()
+            if self.metadata[key].plugin_type == plugin_type
+        ]
+    
+    def get_plugin(self, plugin_type: str, plugin_name: str) -> Optional[PluginInterface]:
+        """Get specific plugin by type and name."""
+        key = f"{plugin_type}:{plugin_name}"
+        return self.plugins.get(key)
 
 
 def _activate_transformers_version(model_name: str) -> None:
@@ -193,425 +435,23 @@ def _activate_transformers_version(model_name: str) -> None:
         logger.info("Using default transformers (4.57.x) for %s", model_name)
 
 
-def _detect_distributed_environment() -> Dict[str, Any]:
-    """Detect distributed training environment (SLURM, PyTorch, etc.)."""
-    env_info = {
-        "is_distributed": False,
-        "backend": "none",
-        "world_size": 1,
-        "local_rank": 0,
-        "global_rank": 0,
-        "node_rank": 0,
-        "num_nodes": 1,
-        "master_addr": None,
-        "master_port": None,
-        "is_slurm": False,
-    }
-    
-    # Check for SLURM environment
-    slurm_job_id = os.getenv("SLURM_JOB_ID")
-    if slurm_job_id:
-        env_info["is_slurm"] = True
-        env_info["world_size"] = int(os.getenv("SLURM_NTASKS", 1))
-        env_info["local_rank"] = int(os.getenv("SLURM_LOCALID", 0))
-        env_info["global_rank"] = int(os.getenv("SLURM_PROCID", 0))
-        env_info["node_rank"] = int(os.getenv("SLURM_NODEID", 0))
-        env_info["num_nodes"] = int(os.getenv("SLURM_JOB_NUM_NODES", 1))
-        
-        # Get master node info from SLURM
-        nodelist = os.getenv("SLURM_JOB_NODELIST", "")
-        if nodelist:
-            # Parse SLURM node list (simplified)
-            if "[" in nodelist:
-                # Handle range format: node[001-003]
-                base = nodelist.split("[")[0]
-                range_part = nodelist.split("[")[1].rstrip("]")
-                if "-" in range_part:
-                    start, end = range_part.split("-")
-                    master_node = f"{base}{start}"
-                else:
-                    master_node = f"{base}{range_part}"
-            else:
-                master_node = nodelist.split(",")[0]
-            
-            env_info["master_addr"] = master_node
-            env_info["master_port"] = os.getenv("SLURM_SRUN_COMM_PORT", "29500")
-        
-        env_info["is_distributed"] = env_info["world_size"] > 1
-        env_info["backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-    
-    # Check for PyTorch distributed environment
-    elif "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        env_info["world_size"] = int(os.environ["WORLD_SIZE"])
-        env_info["global_rank"] = int(os.environ["RANK"])
-        env_info["local_rank"] = int(os.environ.get("LOCAL_RANK", 0))
-        env_info["node_rank"] = int(os.environ.get("NODE_RANK", 0))
-        env_info["master_addr"] = os.environ.get("MASTER_ADDR", "localhost")
-        env_info["master_port"] = os.environ.get("MASTER_PORT", "29500")
-        env_info["is_distributed"] = env_info["world_size"] > 1
-        env_info["backend"] = "nccl" if torch.cuda.is_available() else "gloo"
-    
-    # Check for multi-GPU on single node
-    elif torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        env_info["world_size"] = torch.cuda.device_count()
-        env_info["is_distributed"] = True
-        env_info["backend"] = "nccl"
-        env_info["master_addr"] = "localhost"
-        env_info["master_port"] = "29500"
-    
-    return env_info
+def run_training_process(
+    *,
+    event_queue: Any,
+    stop_queue: Any,
+    config: dict,
+) -> None:
+    """Subprocess entrypoint. Fresh Python — no stale module state.
 
-
-def _setup_distributed_training(env_info: Dict[str, Any]) -> None:
-    """Initialize distributed training if needed."""
-    if not env_info["is_distributed"]:
-        return
-    
-    if dist.is_initialized():
-        logger.info("Distributed training already initialized")
-        return
-    
-    # Set environment variables for distributed training
-    os.environ["MASTER_ADDR"] = env_info["master_addr"] or "localhost"
-    os.environ["MASTER_PORT"] = env_info["master_port"] or "29500"
-    os.environ["WORLD_SIZE"] = str(env_info["world_size"])
-    os.environ["RANK"] = str(env_info["global_rank"])
-    
-    # Initialize process group
-    dist.init_process_group(
-        backend=env_info["backend"],
-        init_method="env://",
-        world_size=env_info["world_size"],
-        rank=env_info["global_rank"],
-    )
-    
-    # Set device for current process
-    if torch.cuda.is_available():
-        torch.cuda.set_device(env_info["local_rank"])
-        device = torch.device(f"cuda:{env_info['local_rank']}")
-    else:
-        device = torch.device("cpu")
-    
-    logger.info(
-        "Initialized distributed training: rank=%d/%d, node=%d/%d, device=%s",
-        env_info["global_rank"],
-        env_info["world_size"],
-        env_info["node_rank"],
-        env_info["num_nodes"],
-        device,
-    )
-
-
-def _configure_deepspeed(
-    model: Any,
-    training_args: Dict[str, Any],
-    env_info: Dict[str, Any],
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Configure DeepSpeed for distributed training."""
-    try:
-        import deepspeed
-        from deepspeed import DeepSpeedConfig
-    except ImportError:
-        logger.warning("DeepSpeed not installed, falling back to standard training")
-        return training_args
-    
-    # Auto-configure DeepSpeed based on hardware
-    ds_config = {
-        "train_batch_size": training_args.get("per_device_train_batch_size", 4) * env_info["world_size"],
-        "gradient_accumulation_steps": training_args.get("gradient_accumulation_steps", 1),
-        "optimizer": {
-            "type": "AdamW",
-            "params": {
-                "lr": training_args.get("learning_rate", 5e-5),
-                "betas": [0.9, 0.999],
-                "eps": 1e-8,
-                "weight_decay": training_args.get("weight_decay", 0.0),
-            }
-        },
-        "scheduler": {
-            "type": "WarmupLR",
-            "params": {
-                "warmup_min_lr": 0,
-                "warmup_max_lr": training_args.get("learning_rate", 5e-5),
-                "warmup_num_steps": training_args.get("warmup_steps", 100),
-            }
-        },
-        "fp16": {
-            "enabled": training_args.get("fp16", True),
-            "loss_scale": 0,
-            "loss_scale_window": 1000,
-            "initial_scale_power": 16,
-            "hysteresis": 2,
-            "min_loss_scale": 1,
-        },
-        "zero_optimization": {
-            "stage": config.get("deepspeed_stage", 2),
-            "allgather_partitions": True,
-            "allgather_bucket_size": 2e8,
-            "overlap_comm": True,
-            "reduce_scatter": True,
-            "reduce_bucket_size": 2e8,
-            "contiguous_gradients": True,
-        },
-        "gradient_clipping": training_args.get("max_grad_norm", 1.0),
-        "steps_per_print": 100,
-        "wall_clock_breakdown": False,
-    }
-    
-    # Add ZeRO-Offload for CPU offloading if enabled
-    if config.get("deepspeed_offload", False):
-        ds_config["zero_optimization"]["offload_optimizer"] = {
-            "device": "cpu",
-            "pin_memory": True,
-        }
-        ds_config["zero_optimization"]["offload_param"] = {
-            "device": "cpu",
-            "pin_memory": True,
-        }
-    
-    # Add gradient checkpointing if enabled
-    if training_args.get("gradient_checkpointing", False):
-        ds_config["activation_checkpointing"] = {
-            "partition_activations": True,
-            "cpu_checkpointing": False,
-            "contiguous_memory_optimization": False,
-            "number_checkpoints": None,
-            "synchronize_checkpoint_boundary": False,
-        }
-    
-    # Update training args with DeepSpeed config
-    training_args["deepspeed"] = ds_config
-    
-    logger.info("Configured DeepSpeed ZeRO stage %d", ds_config["zero_optimization"]["stage"])
-    return training_args
-
-
-def _configure_fsdp(
-    model: Any,
-    training_args: Dict[str, Any],
-    env_info: Dict[str, Any],
-    config: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Configure FSDP for distributed training."""
-    try:
-        from torch.distributed.fsdp import (
-            FullyShardedDataParallel as FSDP,
-            MixedPrecision,
-            BackwardPrefetch,
-            ShardingStrategy,
-            CPUOffload,
-        )
-        from torch.distributed.fsdp.wrap import (
-            size_based_auto_wrap_policy,
-            enable_wrap,
-            wrap,
-        )
-    except ImportError:
-        logger.warning("FSDP not available, falling back to standard training")
-        return training_args
-    
-    # Auto-configure FSDP based on model size and hardware
-    fsdp_config = {
-        "sharding_strategy": config.get("fsdp_sharding_strategy", "FULL_SHARD"),
-        "backward_prefetch": config.get("fsdp_backward_prefetch", "BACKWARD_PRE"),
-        "mixed_precision": config.get("fsdp_mixed_precision", True),
-        "cpu_offload": config.get("fsdp_cpu_offload", False),
-        "activation_checkpointing": training_args.get("gradient_checkpointing", False),
-    }
-    
-    # Convert string configs to enums
-    sharding_map = {
-        "FULL_SHARD": ShardingStrategy.FULL_SHARD,
-        "SHARD_GRAD_OP": ShardingStrategy.SHARD_GRAD_OP,
-        "NO_SHARD": ShardingStrategy.NO_SHARD,
-    }
-    
-    backward_prefetch_map = {
-        "BACKWARD_PRE": BackwardPrefetch.BACKWARD_PRE,
-        "BACKWARD_POST": BackwardPrefetch.BACKWARD_POST,
-    }
-    
-    # Update training args with FSDP config
-    training_args["fsdp"] = []
-    
-    if fsdp_config["sharding_strategy"] in sharding_map:
-        training_args["fsdp"].append(fsdp_config["sharding_strategy"])
-    
-    if fsdp_config["backward_prefetch"] in backward_prefetch_map:
-        training_args["fsdp"].append(fsdp_config["backward_prefetch"])
-    
-    if fsdp_config["mixed_precision"]:
-        training_args["fsdp"].append("FULL_SHARD")
-    
-    if fsdp_config["cpu_offload"]:
-        training_args["fsdp"].append("OFFLOAD")
-    
-    if fsdp_config["activation_checkpointing"]:
-        training_args["fsdp"].append("AUTO_WRAP")
-    
-    logger.info("Configured FSDP with strategy: %s", fsdp_config["sharding_strategy"])
-    return training_args
-
-
-def _configure_gradient_checkpointing(model: Any, training_args: Dict[str, Any]) -> None:
-    """Enable gradient checkpointing for memory efficiency."""
-    if not training_args.get("gradient_checkpointing", False):
-        return
-    
-    try:
-        # For HuggingFace models
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-            logger.info("Enabled gradient checkpointing via HuggingFace API")
-        # For PyTorch models
-        elif hasattr(model, "enable_gradient_checkpointing"):
-            model.enable_gradient_checkpointing()
-            logger.info("Enabled gradient checkpointing via PyTorch API")
-        # Manual gradient checkpointing
-        else:
-            from torch.utils.checkpoint import checkpoint
-            # Store original forward method
-            original_forward = model.forward
-            
-            def checkpointed_forward(*args, **kwargs):
-                return checkpoint(original_forward, *args, **kwargs)
-            
-            model.forward = checkpointed_forward
-            logger.info("Enabled manual gradient checkpointing")
-            
-    except Exception as e:
-        logger.warning("Failed to enable gradient checkpointing: %s", str(e))
-
-
-def _wrap_model_for_distributed(
-    model: Any,
-    training_args: Dict[str, Any],
-    env_info: Dict[str, Any],
-    config: Dict[str, Any],
-) -> Any:
-    """Wrap model for distributed training."""
-    if not env_info["is_distributed"]:
-        return model
-    
-    # Check for DeepSpeed
-    if "deepspeed" in training_args:
-        try:
-            import deepspeed
-            model_engine, optimizer, _, _ = deepspeed.initialize(
-                model=model,
-                config=training_args["deepspeed"],
-                model_parameters=model.parameters(),
-            )
-            logger.info("Wrapped model with DeepSpeed")
-            return model_engine
-        except Exception as e:
-            logger.error("Failed to initialize DeepSpeed: %s", str(e))
-    
-    # Check for FSDP
-    elif "fsdp" in training_args:
-        try:
-            from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-            from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-            
-            # Auto-wrap policy based on parameter count
-            auto_wrap_policy = size_based_auto_wrap_policy(
-                min_num_params=1e6,  # Wrap modules with >1M parameters
-            )
-            
-            # Mixed precision policy
-            from torch.distributed.fsdp import MixedPrecision
-            from torch.distributed.fsdp.sharded_grad_scaler import ShardedGradScaler
-            
-            mp_policy = MixedPrecision(
-                param_dtype=torch.float16,
-                reduce_dtype=torch.float16,
-                buffer_dtype=torch.float16,
-            ) if config.get("fsdp_mixed_precision", True) else None
-            
-            # Wrap model with FSDP
-            model = FSDP(
-                model,
-                auto_wrap_policy=auto_wrap_policy,
-                mixed_precision=mp_policy,
-                device_id=torch.cuda.current_device() if torch.cuda.is_available() else None,
-            )
-            logger.info("Wrapped model with FSDP")
-            return model
-            
-        except Exception as e:
-            logger.error("Failed to wrap model with FSDP: %s", str(e))
-    
-    # Fall back to DDP
-    elif env_info["world_size"] > 1:
-        try:
-            model = DDP(
-                model,
-                device_ids=[env_info["local_rank"]] if torch.cuda.is_available() else None,
-                output_device=env_info["local_rank"] if torch.cuda.is_available() else None,
-                find_unused_parameters=config.get("find_unused_parameters", False),
-            )
-            logger.info("Wrapped model with DDP")
-            return model
-        except Exception as e:
-            logger.error("Failed to wrap model with DDP: %s", str(e))
-    
-    return model
-
-
-def _setup_multi_node_training(config: Dict[str, Any], env_info: Dict[str, Any]) -> None:
-    """Setup multi-node training with SLURM integration."""
-    if not env_info["is_slurm"] or env_info["num_nodes"] <= 1:
-        return
-    
-    logger.info(
-        "Setting up multi-node training: %d nodes, %d GPUs per node",
-        env_info["num_nodes"],
-        env_info["world_size"] // env_info["num_nodes"],
-    )
-    
-    # Set SLURM-specific environment variables
-    os.environ["NCCL_DEBUG"] = "INFO"
-    os.environ["NCCL_SOCKET_IFNAME"] = "^docker0,lo"
-    
-    # Configure network interface for multi-node communication
-    if config.get("network_interface"):
-        os.environ["NCCL_SOCKET_IFNAME"] = config["network_interface"]
-    
-    # Set distributed backend
-    if torch.cuda.is_available():
-        os.environ["NCCL_IB_DISABLE"] = "1" if config.get("disable_infiniband", False) else "0"
-        os.environ["NCCL_NET_GDR_LEVEL"] = config.get("nccl_gdr_level", "0")
-    
-    logger.info("Multi-node training configured with SLURM")
-
-
-@celery_app.task(
-    base=ProgressTask,
-    bind=True,
-    name="core.training.worker.run_training_task",
-    max_retries=3,
-    default_retry_delay=30,
-    acks_late=True,
-    reject_on_worker_lost=True,
-)
-def run_training_task(self, config: dict) -> Dict[str, Any]:
-    """Celery task for distributed training.
-    
     Args:
+        event_queue: mp.Queue for sending progress/status/error events to parent.
+        stop_queue: mp.Queue for receiving stop commands from parent.
         config: Training configuration dict with all parameters.
-        
-    Returns:
-        Dict with training results and metadata.
     """
-    task_id = self.request.id
-    logger.info("Starting training task %s", task_id)
-    
-    # Initialize progress tracking
-    self.update_progress(task_id, 0.0, "Initializing training environment")
-    
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["PYTHONWARNINGS"] = "ignore"
+    os.environ["PYTHONWARNINGS"] = (
+        "ignore"  # Suppress warnings at C-level before imports
+    )
 
     import warnings
     from loggers.config import LogConfig
@@ -620,392 +460,303 @@ def run_training_task(self, config: dict) -> Dict[str, Any]:
         warnings.filterwarnings("ignore")
 
     LogConfig.setup_logging(
-        service_name="vex-studio-training-worker",
-        env=os.getenv("ENVIRONMENT_TYPE", "production"),
+        service_name = "vex-studio-training-worker",
+        env = os.getenv("ENVIRONMENT_TYPE", "production"),
     )
 
     model_name = config["model_name"]
 
     # ── 1. Activate correct transformers version BEFORE any ML imports ──
     try:
-        self.update_progress(task_id, 0.05, "Activating transformers version")
         _activate_transformers_version(model_name)
-    except Exception as e:
-        logger.error("Failed to activate transformers version: %s", str(e))
-        raise
-
-    # ── 2. Detect distributed environment ──
-    self.update_progress(task_id, 0.1, "Detecting distributed environment")
-    env_info = _detect_distributed_environment()
-    
-    # Store environment info in config for later use
-    config["_env_info"] = env_info
-    
-    # Setup multi-node training if applicable
-    if env_info["num_nodes"] > 1:
-        self.update_progress(task_id, 0.12, "Setting up multi-node training")
-        _setup_multi_node_training(config, env_info)
-    
-    # Setup distributed training
-    if env_info["is_distributed"]:
-        self.update_progress(task_id, 0.15, "Initializing distributed training")
-        _setup_distributed_training(env_info)
-    
-    # ── 3. Import ML libraries after distributed setup ──
-    self.update_progress(task_id, 0.2, "Loading ML libraries")
-    try:
-        from transformers import (
-            AutoModelForCausalLM,
-            AutoTokenizer,
-            TrainingArguments,
-            Trainer,
+    except Exception as exc:
+        event_queue.put(
+            {
+                "type": "error",
+                "error": f"Failed to activate transformers version: {exc}",
+                "stack": traceback.format_exc(limit = 20),
+                "ts": time.time(),
+            }
         )
-        from datasets import Dataset
-        import vex
-        from vex import FastLanguageModel
-        from vex.chat_templates import get_chat_template
-    except ImportError as e:
-        logger.error("Failed to import ML libraries: %s", str(e))
-        raise
+        return
 
-    # ── 4. Load model and tokenizer ──
-    self.update_progress(task_id, 0.25, "Loading model and tokenizer")
-    try:
-        # Load model with Unsloth optimizations
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=model_name,
-            max_seq_length=config.get("max_seq_length", 2048),
-            dtype=config.get("dtype", None),
-            load_in_4bit=config.get("load_in_4bit", True),
+    # ── 1a. Auto-enable trust_remote_code for vex/* transformers 5.x models ──
+    # Some newer architectures (e.g. NemotronH) have config parsing bugs in
+    # transformers that require trust_remote_code=True as a workaround.
+    # Only auto-enable for vex/* prefixed models (trusted source).
+    from utils.transformers_version import needs_transformers_5
+
+    if (
+        needs_transformers_5(model_name)
+        and model_name.lower().startswith("vex/")
+        and not config.get("trust_remote_code", False)
+    ):
+        config["trust_remote_code"] = True
+        logger.info(
+            "Auto-enabled trust_remote_code for vex/* transformers 5.x model: %s",
+            model_name,
         )
-        
-        # Apply chat template if specified
-        if config.get("chat_template"):
-            tokenizer = get_chat_template(
-                tokenizer,
-                chat_template=config["chat_template"],
+
+    # ── 1b. Auto-install mamba-ssm for SSM/hybrid models (NemotronH, Falcon-H1) ──
+    _SSM_MODEL_SUBSTRINGS = ("nemotron_h", "nemotron-3-nano", "falcon_h1", "falcon-h1")
+    if any(sub in model_name.lower() for sub in _SSM_MODEL_SUBSTRINGS):
+        try:
+            import mamba_ssm  # noqa: F401
+
+            logger.info("mamba-ssm already installed")
+        except ImportError:
+            logger.info(
+                "SSM model detected — installing mamba-ssm and causal-conv1d (this may take several minutes)..."
             )
-        
-        logger.info("Loaded model %s with %d parameters", 
-                   model_name, sum(p.numel() for p in model.parameters()))
-        
-    except Exception as e:
-        logger.error("Failed to load model: %s", str(e))
-        raise
+            _send_status(
+                event_queue, "Installing mamba-ssm (first time only, ~7 min)..."
+            )
+            import subprocess as _sp
 
-    # ── 5. Configure distributed training strategy ──
-    self.update_progress(task_id, 0.3, "Configuring distributed training")
-    
-    # Prepare training arguments
-    training_args = {
-        "output_dir": config.get("output_dir", "./output"),
-        "per_device_train_batch_size": config.get("per_device_train_batch_size", 4),
-        "gradient_accumulation_steps": config.get("gradient_accumulation_steps", 1),
-        "learning_rate": config.get("learning_rate", 5e-5),
-        "weight_decay": config.get("weight_decay", 0.0),
-        "warmup_steps": config.get("warmup_steps", 100),
-        "max_steps": config.get("max_steps", 1000),
-        "logging_steps": config.get("logging_steps", 10),
-        "save_steps": config.get("save_steps", 500),
-        "evaluation_strategy": config.get("evaluation_strategy", "no"),
-        "fp16": config.get("fp16", True),
-        "bf16": config.get("bf16", False),
-        "max_grad_norm": config.get("max_grad_norm", 1.0),
-        "gradient_checkpointing": config.get("gradient_checkpointing", True),
-        "dataloader_num_workers": config.get("dataloader_num_workers", 4),
-        "remove_unused_columns": False,
-        "report_to": config.get("report_to", "none"),
-        "local_rank": env_info["local_rank"],
-        "ddp_find_unused_parameters": config.get("find_unused_parameters", False),
-    }
-    
-    # Configure distributed training strategy
-    distributed_strategy = config.get("distributed_strategy", "auto")
-    
-    if distributed_strategy == "auto":
-        # Auto-detect best strategy based on model size and hardware
-        model_size_mb = sum(p.numel() for p in model.parameters()) * 4 / (1024 ** 2)  # Assuming float32
-        
-        if model_size_mb > 10000:  # >10GB model
-            distributed_strategy = "deepspeed"
-        elif env_info["world_size"] > 2:
-            distributed_strategy = "fsdp"
-        else:
-            distributed_strategy = "ddp"
-    
-    # Apply distributed strategy
-    if distributed_strategy == "deepspeed":
-        self.update_progress(task_id, 0.35, "Configuring DeepSpeed")
-        training_args = _configure_deepspeed(model, training_args, env_info, config)
-    elif distributed_strategy == "fsdp":
-        self.update_progress(task_id, 0.35, "Configuring FSDP")
-        training_args = _configure_fsdp(model, training_args, env_info, config)
-    
-    # Enable gradient checkpointing
-    if training_args.get("gradient_checkpointing", False):
-        self.update_progress(task_id, 0.4, "Enabling gradient checkpointing")
-        _configure_gradient_checkpointing(model, training_args)
-    
-    # Wrap model for distributed training
-    if env_info["is_distributed"]:
-        self.update_progress(task_id, 0.45, "Wrapping model for distributed training")
-        model = _wrap_model_for_distributed(model, training_args, env_info, config)
-    
-    # ── 6. Prepare dataset ──
-    self.update_progress(task_id, 0.5, "Preparing dataset")
-    try:
-        # Load and prepare dataset
-        dataset_config = config.get("dataset", {})
-        
-        # This would be replaced with actual dataset loading logic
-        # For now, create a dummy dataset
-        train_dataset = Dataset.from_dict({
-            "text": ["Sample training text"] * 100,
-        })
-        
-        if config.get("evaluation_strategy") != "no":
-            eval_dataset = Dataset.from_dict({
-                "text": ["Sample evaluation text"] * 20,
-            })
-        else:
-            eval_dataset = None
-            
-    except Exception as e:
-        logger.error("Failed to prepare dataset: %s", str(e))
-        raise
-    
-    # ── 7. Setup training ──
-    self.update_progress(task_id, 0.6, "Setting up trainer")
-    try:
-        # Create TrainingArguments object
-        from transformers import TrainingArguments
-        
-        # Convert dict to TrainingArguments
-        training_args_obj = TrainingArguments(**training_args)
-        
-        # Initialize trainer
-        trainer = Trainer(
-            model=model,
-            args=training_args_obj,
-            train_dataset=train_dataset,
-            eval_dataset=eval_dataset,
-            tokenizer=tokenizer,
-        )
-        
-    except Exception as e:
-        logger.error("Failed to setup trainer: %s", str(e))
-        raise
-    
-    # ── 8. Run training ──
-    self.update_progress(task_id, 0.7, "Starting training")
-    
-    # Track training metrics
-    training_metrics = {
-        "start_time": time.time(),
-        "world_size": env_info["world_size"],
-        "distributed_strategy": distributed_strategy,
-        "model_parameters": sum(p.numel() for p in model.parameters()),
-    }
-    
-    try:
-        # Custom training loop with progress updates
-        total_steps = training_args_obj.max_steps
-        current_step = 0
-        
-        # Override trainer's logging to update progress
-        class ProgressCallback:
-            def __init__(self, task, task_id, total_steps):
-                self.task = task
-                self.task_id = task_id
-                self.total_steps = total_steps
-                self.current_step = 0
-            
-            def on_log(self, args, state, control, logs=None, **kwargs):
-                self.current_step = state.global_step
-                progress = 0.7 + (0.25 * (self.current_step / self.total_steps))
-                
-                # Extract loss from logs
-                loss = logs.get("loss", 0.0) if logs else 0.0
-                
-                self.task.update_progress(
-                    self.task_id,
-                    progress,
-                    f"Training step {self.current_step}/{self.total_steps}",
-                    {
-                        "step": self.current_step,
-                        "total_steps": self.total_steps,
-                        "loss": loss,
-                        "learning_rate": logs.get("learning_rate", 0.0) if logs else 0.0,
-                    }
+            # --no-build-isolation: compile against current torch (no version conflicts)
+            # --no-deps: don't pull in torch/transformers/triton (already installed)
+            for _pkg in ["causal_conv1d", "mamba_ssm"]:
+                _r = _sp.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pip",
+                        "install",
+                        "--no-build-isolation",
+                        "--no-deps",
+                        "--no-cache-dir",
+                        _pkg,
+                    ],
+                    stdout = _sp.PIPE,
+                    stderr = _sp.STDOUT,
+                    text = True,
                 )
+                if _r.returncode != 0:
+                    logger.error("Failed to install %s:\n%s", _pkg, _r.stdout)
+                else:
+                    logger.info("Installed %s successfully", _pkg)
+            logger.info("mamba-ssm installation complete")
+
+    # ── 1c. Set fork start method so dataset.map() can multiprocess ──
+    # The parent launched us via spawn (clean process), but the compiled
+    # SFTTrainer checks get_start_method() and disables num_proc if not "fork".
+    # Linux only: fork is the default start method and is safe here (no CUDA
+    # context exists yet). macOS defaults to spawn since Python 3.8 because
+    # fork is unsafe with macOS frameworks (Metal/MPS, CoreFoundation) --
+    # do NOT override on macOS. Windows has no fork at all.
+    if sys.platform == "linux":
+        import multiprocessing as _mp
+
+        try:
+            _mp.set_start_method("fork", force = True)
+        except RuntimeError:
+            pass  # Already set
+
+    # ── 1c. On Windows, check Triton availability (must be before import torch) ──
+    if sys.platform == "win32":
+        try:
+            import triton  # noqa: F401
+
+            logger.info("Triton available — torch.compile enabled")
+        except ImportError:
+            os.environ["TORCHDYNAMO_DISABLE"] = "1"
+            logger.warning(
+                "Triton not found on Windows — torch.compile disabled. "
+                'Install for better performance: pip install "triton-windows<3.7"'
+            )
+
+    # ── 2. Now import ML libraries (fresh in this clean process) ──
+    try:
+        _send_status(event_queue, "Importing Unsloth...")
+
+        backend_path = str(Path(__file__).resolve().parent.parent.parent)
+        if backend_path not in sys.path:
+            sys.path.insert(0, backend_path)
+
+        from core.training.trainer import UnslothTrainer, TrainingProgress
+        from utils.paths import (
+            ensure_dir,
+            resolve_output_dir,
+            resolve_tensorboard_dir,
+            datasets_root,
+        )
+
+        import transformers
+
+        logger.info("Subprocess loaded transformers %s", transformers.__version__)
+    except Exception as exc:
+        event_queue.put(
+            {
+                "type": "error",
+                "error": f"Failed to import ML libraries: {exc}",
+                "stack": traceback.format_exc(limit = 20),
+                "ts": time.time(),
+            }
+        )
+        return
+
+    # ── 2b. Initialize plugin system ──
+    plugin_dirs = [
+        Path.home() / ".vex" / "plugins",
+        Path("/etc/vex/plugins"),
+        Path(backend_path) / "plugins",
+    ]
+    
+    # Add custom plugin directories from config
+    if "plugin_dirs" in config:
+        for dir_path in config["plugin_dirs"]:
+            plugin_dirs.append(Path(dir_path))
+    
+    plugin_registry = PluginRegistry(plugin_dirs)
+    
+    try:
+        _send_status(event_queue, "Loading plugins...")
+        plugin_registry.load_all_plugins()
         
-        # Add progress callback
-        from transformers import TrainerCallback
-        progress_callback = ProgressCallback(self, task_id, total_steps)
-        trainer.add_callback(progress_callback)
+        # Log loaded plugins
+        for plugin_key, metadata in plugin_registry.metadata.items():
+            logger.info("Loaded plugin: %s v%s (%s)", 
+                       metadata.name, metadata.version, metadata.plugin_type)
+            
+    except Exception as exc:
+        logger.warning("Failed to initialize plugin system: %s", exc)
+        logger.debug(traceback.format_exc())
+        # Continue without plugins
+    
+    # ── 2c. Check for hot-reload requests ──
+    def check_for_reload():
+        """Check if plugins should be reloaded."""
+        reload_file = Path.home() / ".vex" / "reload_plugins"
+        if reload_file.exists():
+            try:
+                reload_file.unlink()
+                plugin_registry.reload_plugins()
+                logger.info("Plugins hot-reloaded successfully")
+            except Exception as e:
+                logger.error("Failed to hot-reload plugins: %s", e)
+    
+    # ── 3. Setup training configuration ──
+    try:
+        _send_status(event_queue, "Setting up training...")
+        
+        # Check for custom training loop plugin
+        trainer_class = UnslothTrainer
+        training_plugins = plugin_registry.get_plugins_by_type("training")
+        
+        if training_plugins:
+            # Use first available training plugin
+            training_plugin = training_plugins[0]
+            metadata = training_plugin.get_metadata()
+            logger.info("Using custom training loop from plugin: %s", metadata.name)
+            
+            # Get custom trainer class
+            custom_trainer = training_plugin.create_trainer(config)
+            if custom_trainer is not None:
+                trainer_class = type(custom_trainer)
+        
+        # Check for custom quantization plugins
+        quantization_plugins = plugin_registry.get_plugins_by_type("quantization")
+        if quantization_plugins:
+            logger.info("Found %d quantization plugins", len(quantization_plugins))
+            # Store for later use
+            config["_quantization_plugins"] = quantization_plugins
+        
+        # Check for custom CUDA kernel plugins
+        kernel_plugins = plugin_registry.get_plugins_by_type("kernel")
+        if kernel_plugins:
+            logger.info("Found %d CUDA kernel plugins", len(kernel_plugins))
+            # Load kernel modules
+            for kernel_plugin in kernel_plugins:
+                try:
+                    kernel_module = kernel_plugin.get_kernel_module()
+                    if kernel_module:
+                        # Make kernel functions available
+                        kernel_functions = kernel_plugin.get_kernel_functions()
+                        for func_name, func in kernel_functions.items():
+                            # Register in global namespace for use by trainer
+                            globals()[f"custom_kernel_{func_name}"] = func
+                        logger.info("Loaded custom CUDA kernels from %s", 
+                                   kernel_plugin.get_metadata().name)
+                except Exception as e:
+                    logger.warning("Failed to load CUDA kernels from plugin: %s", e)
+        
+        # Check for data processing plugins
+        data_plugins = plugin_registry.get_plugins_by_type("data_processing")
+        if data_plugins:
+            logger.info("Found %d data processing plugins", len(data_plugins))
+            config["_data_plugins"] = data_plugins
+        
+    except Exception as exc:
+        event_queue.put(
+            {
+                "type": "error",
+                "error": f"Failed to setup training configuration: {exc}",
+                "stack": traceback.format_exc(limit=20),
+                "ts": time.time(),
+            }
+        )
+        return
+
+    # ── 4. Run training ──
+    try:
+        # Periodically check for plugin reload requests
+        import threading
+        reload_thread = threading.Thread(
+            target=lambda: [check_for_reload() or time.sleep(5) for _ in range(100)],
+            daemon=True
+        )
+        reload_thread.start()
+        
+        # Create trainer instance
+        trainer = trainer_class(
+            config=config,
+            event_queue=event_queue,
+            stop_queue=stop_queue,
+            plugin_registry=plugin_registry,
+        )
         
         # Run training
-        train_result = trainer.train()
+        trainer.train()
         
-        # Update metrics
-        training_metrics.update({
-            "end_time": time.time(),
-            "total_duration": time.time() - training_metrics["start_time"],
-            "final_loss": train_result.training_loss,
-            "global_step": train_result.global_step,
-        })
-        
-    except Exception as e:
-        logger.error("Training failed: %s", str(e))
-        training_metrics["error"] = str(e)
-        raise
+    except Exception as exc:
+        event_queue.put(
+            {
+                "type": "error",
+                "error": f"Training failed: {exc}",
+                "stack": traceback.format_exc(limit=20),
+                "ts": time.time(),
+            }
+        )
+        return
     
-    # ── 9. Save model ──
-    self.update_progress(task_id, 0.95, "Saving model")
-    try:
-        # Save model and tokenizer
-        output_dir = config.get("output_dir", "./output")
+    finally:
+        # Cleanup
+        check_for_reload()  # Final check for reload requests
         
-        # Only save on main process in distributed training
-        if not env_info["is_distributed"] or env_info["global_rank"] == 0:
-            # Handle different model wrappers
-            model_to_save = model
-            if hasattr(model, "module"):
-                model_to_save = model.module
-            elif hasattr(model, "_fsdp_wrapped_module"):
-                model_to_save = model._fsdp_wrapped_module
-            
-            # Save with Unsloth optimizations
-            model_to_save.save_pretrained(
-                output_dir,
-                save_method=config.get("save_method", "merged_16bit"),
-                tokenizer=tokenizer,
-            )
-            
-            logger.info("Model saved to %s", output_dir)
-        
-    except Exception as e:
-        logger.error("Failed to save model: %s", str(e))
-        raise
+        # Unload plugins
+        try:
+            for plugin_key, plugin in plugin_registry.plugins.items():
+                if hasattr(plugin, 'cleanup'):
+                    plugin.cleanup()
+        except Exception as e:
+            logger.warning("Error during plugin cleanup: %s", e)
     
-    # ── 10. Cleanup ──
-    self.update_progress(task_id, 0.98, "Cleaning up")
-    
-    # Cleanup distributed training
-    if env_info["is_distributed"] and dist.is_initialized():
-        dist.destroy_process_group()
-    
-    # ── 11. Return results ──
-    self.update_progress(task_id, 1.0, "Training completed")
-    
-    results = {
-        "status": "completed",
-        "task_id": task_id,
-        "model_name": model_name,
-        "output_dir": config.get("output_dir", "./output"),
-        "training_metrics": training_metrics,
-        "distributed_info": {
-            "world_size": env_info["world_size"],
-            "num_nodes": env_info["num_nodes"],
-            "strategy": distributed_strategy,
-            "backend": env_info["backend"],
-        },
-        "timestamp": time.time(),
-    }
-    
-    logger.info("Training task %s completed successfully", task_id)
-    return results
-
-
-@celery_app.task(
-    base=ProgressTask,
-    bind=True,
-    name="core.training.worker.run_data_recipe_task",
-    max_retries=3,
-    default_retry_delay=30,
-    acks_late=True,
-    reject_on_worker_lost=True,
-)
-def run_data_recipe_task(self, config: dict) -> Dict[str, Any]:
-    """Celery task for data recipe processing.
-    
-    Args:
-        config: Data recipe configuration dict.
-        
-    Returns:
-        Dict with processing results.
-    """
-    task_id = self.request.id
-    logger.info("Starting data recipe task %s", task_id)
-    
-    # Initialize progress tracking
-    self.update_progress(task_id, 0.0, "Initializing data recipe")
-    
-    try:
-        # Import data processing libraries
-        from datasets import Dataset, DatasetDict
-        import pandas as pd
-        import numpy as np
-        
-        # Process data recipe
-        recipe_type = config.get("recipe_type", "default")
-        data_source = config.get("data_source")
-        
-        self.update_progress(task_id, 0.2, "Loading data source")
-        
-        # Load data based on source type
-        if data_source.startswith("s3://"):
-            # S3 data loading logic
-            pass
-        elif data_source.startswith("hdfs://"):
-            # HDFS data loading logic
-            pass
-        else:
-            # Local file loading
-            if data_source.endswith(".csv"):
-                df = pd.read_csv(data_source)
-            elif data_source.endswith(".json"):
-                df = pd.read_json(data_source)
-            elif data_source.endswith(".parquet"):
-                df = pd.read_parquet(data_source)
-            else:
-                raise ValueError(f"Unsupported data format: {data_source}")
-        
-        self.update_progress(task_id, 0.5, "Processing data")
-        
-        # Apply data recipe transformations
-        # This would be replaced with actual recipe processing logic
-        
-        self.update_progress(task_id, 0.8, "Saving processed data")
-        
-        # Save processed data
-        output_path = config.get("output_path", "./processed_data")
-        
-        results = {
+    event_queue.put(
+        {
+            "type": "status",
             "status": "completed",
-            "task_id": task_id,
-            "input_rows": len(df),
-            "output_path": output_path,
-            "timestamp": time.time(),
+            "ts": time.time(),
         }
-        
-        self.update_progress(task_id, 1.0, "Data recipe completed")
-        return results
-        
-    except Exception as e:
-        logger.error("Data recipe task failed: %s", str(e))
-        raise
+    )
 
 
-# ── Health Check Task ─────────────────────────────────────────────────────────
-@celery_app.task(name="core.training.worker.health_check")
-def health_check() -> Dict[str, Any]:
-    """Health check task for monitoring worker status."""
-    return {
-        "status": "healthy",
-        "timestamp": time.time(),
-        "worker_id": os.getenv("HOSTNAME", "unknown"),
-        "gpu_available": torch.cuda.is_available(),
-        "gpu_count": torch.cuda.device_count() if torch.cuda.is_available() else 0,
-        "distributed_initialized": dist.is_initialized() if "dist" in globals() else False,
-    }
+def _send_status(queue: Any, message: str) -> None:
+    """Helper to send status updates."""
+    queue.put(
+        {
+            "type": "status",
+            "status": "running",
+            "message": message,
+            "ts": time.time(),
+        }
+    )

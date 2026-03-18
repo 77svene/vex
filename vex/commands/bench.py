@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlencode
+
+import vex
+from vex.commands import ScrapyCommand
+from vex.http import Response, TextResponse
+from vex.linkextractors import LinkExtractor
+from vex.utils.test import get_testenv
+
+if TYPE_CHECKING:
+    import argparse
+    from collections.abc import AsyncIterator
+
+
+class Command(ScrapyCommand):
+    default_settings = {
+        "LOG_LEVEL": "INFO",
+        "LOGSTATS_INTERVAL": 1,
+        "CLOSESPIDER_TIMEOUT": 10,
+    }
+
+    def short_desc(self) -> str:
+        return "Run quick benchmark test"
+
+    def run(self, args: list[str], opts: argparse.Namespace) -> None:
+        with _BenchServer():
+            assert self.crawler_process
+            self.crawler_process.crawl(_BenchSpider, total=100000)
+            self.crawler_process.start()
+
+
+class _BenchServer:
+    def __enter__(self) -> None:
+        pargs = [sys.executable, "-u", "-m", "vex.utils.benchserver"]
+        self.proc = subprocess.Popen(  # noqa: S603
+            pargs, stdout=subprocess.PIPE, env=get_testenv()
+        )
+        assert self.proc.stdout
+        self.proc.stdout.readline()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:  # type: ignore[no-untyped-def]
+        self.proc.kill()
+        self.proc.wait()
+        time.sleep(0.2)
+
+
+class _BenchSpider(vex.Spider):
+    """A spider that follows all links"""
+
+    name = "follow"
+    total = 10000
+    show = 20
+    baseurl = "http://localhost:8998"
+    link_extractor = LinkExtractor()
+
+    async def start(self) -> AsyncIterator[Any]:
+        qargs = {"total": self.total, "show": self.show}
+        url = f"{self.baseurl}?{urlencode(qargs, doseq=True)}"
+        yield vex.Request(url, dont_filter=True)
+
+    def parse(self, response: Response) -> Any:
+        assert isinstance(response, TextResponse)
+        for link in self.link_extractor.extract_links(response):
+            yield vex.Request(link.url, callback=self.parse)

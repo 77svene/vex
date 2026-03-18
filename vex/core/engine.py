@@ -149,7 +149,148 @@ class ExecutionEngine:
             if hasattr(self, "downloader"):
                 self.downloader.close()
             raise
-
+        
+        # Initialize observability components
+        self._init_observability()
+    
+    def _init_observability(self):
+        """Initialize observability stack components."""
+        # OpenTelemetry tracing
+        self._tracer = None
+        if self.settings.getbool('OPENTELEMETRY_ENABLED', False):
+            try:
+                from opentelemetry import trace
+                from opentelemetry.sdk.trace import TracerProvider
+                from opentelemetry.sdk.trace.export import BatchSpanProcessor
+                from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+                
+                # Set up tracer provider
+                trace.set_tracer_provider(TracerProvider())
+                otlp_exporter = OTLPSpanExporter(
+                    endpoint=self.settings.get('OTLP_ENDPOINT', 'localhost:4317')
+                )
+                trace.get_tracer_provider().add_span_processor(
+                    BatchSpanProcessor(otlp_exporter)
+                )
+                self._tracer = trace.get_tracer("vex.engine")
+                logger.info("OpenTelemetry tracing enabled")
+            except ImportError:
+                logger.warning("OpenTelemetry packages not installed. Tracing disabled.")
+        
+        # Prometheus metrics
+        self._metrics_enabled = self.settings.getbool('PROMETHEUS_METRICS_ENABLED', False)
+        self._metrics = {}
+        if self._metrics_enabled:
+            try:
+                from prometheus_client import Counter, Histogram, Gauge
+                
+                # Define metrics
+                self._metrics['requests_total'] = Counter(
+                    'vex_requests_total', 
+                    'Total number of requests made',
+                    ['spider', 'method', 'status']
+                )
+                self._metrics['request_duration_seconds'] = Histogram(
+                    'vex_request_duration_seconds',
+                    'Request duration in seconds',
+                    ['spider', 'method'],
+                    buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0]
+                )
+                self._metrics['active_requests'] = Gauge(
+                    'vex_active_requests',
+                    'Number of active requests',
+                    ['spider']
+                )
+                self._metrics['scheduler_queue_size'] = Gauge(
+                    'vex_scheduler_queue_size',
+                    'Number of requests in scheduler queue',
+                    ['spider']
+                )
+                self._metrics['errors_total'] = Counter(
+                    'vex_errors_total',
+                    'Total number of errors',
+                    ['spider', 'error_type']
+                )
+                logger.info("Prometheus metrics enabled")
+            except ImportError:
+                logger.warning("prometheus_client not installed. Metrics disabled.")
+                self._metrics_enabled = False
+        
+        # Anomaly detection state
+        self._anomaly_detector = None
+        if self.settings.getbool('ANOMALY_DETECTION_ENABLED', False):
+            try:
+                from vex.extensions.anomaly_detection import AnomalyDetector
+                self._anomaly_detector = AnomalyDetector(self.crawler)
+                logger.info("Anomaly detection enabled")
+            except ImportError:
+                logger.warning("Anomaly detection module not available")
+        
+        # Request replay log
+        self._request_log = []
+        self._max_request_log_size = self.settings.getint('REQUEST_LOG_SIZE', 1000)
+    
+    def _record_metric(self, name: str, labels: dict = None, value: float = 1):
+        """Record a metric if metrics are enabled."""
+        if not self._metrics_enabled or name not in self._metrics:
+            return
+        
+        metric = self._metrics[name]
+        if labels:
+            metric = metric.labels(**labels)
+        
+        if hasattr(metric, 'inc'):
+            metric.inc(value)
+        elif hasattr(metric, 'observe'):
+            metric.observe(value)
+        elif hasattr(metric, 'set'):
+            metric.set(value)
+    
+    def _create_span(self, name: str, attributes: dict = None):
+        """Create an OpenTelemetry span if tracing is enabled."""
+        if not self._tracer:
+            return None
+        
+        span = self._tracer.start_span(name)
+        if attributes:
+            for key, value in attributes.items():
+                span.set_attribute(key, value)
+        return span
+    
+    def _log_request_for_replay(self, request: Request, response: Response = None, 
+                               error: Exception = None):
+        """Log request details for replay capability."""
+        log_entry = {
+            'timestamp': time(),
+            'url': request.url,
+            'method': request.method,
+            'headers': dict(request.headers),
+            'meta': request.meta.copy(),
+            'body': request.body,
+            'spider_name': self.spider.name if self.spider else None,
+        }
+        
+        if response:
+            log_entry['response'] = {
+                'status': response.status,
+                'headers': dict(response.headers),
+                'body': response.body[:1000],  # Limit body size
+                'url': response.url,
+            }
+        
+        if error:
+            log_entry['error'] = {
+                'type': type(error).__name__,
+                'message': str(error),
+                'traceback': format_exc() if isinstance(error, Exception) else None,
+            }
+        
+        self._request_log.append(log_entry)
+        
+        # Trim log if too large
+        if len(self._request_log) > self._max_request_log_size:
+            self._request_log = self._request_log[-self._max_request_log_size:]
+    
     def _get_scheduler_class(self, settings: BaseSettings) -> type[BaseScheduler]:
         scheduler_cls: type[BaseScheduler] = load_object(settings["SCHEDULER"])
         if not issubclass(scheduler_cls, BaseScheduler):
@@ -180,6 +321,10 @@ class ExecutionEngine:
             raise RuntimeError("Engine already running")
         self.start_time = time()
         self._starting = True
+        
+        # Record engine start metric
+        self._record_metric('engine_starts_total', {'spider': self.spider.name if self.spider else 'unknown'})
+        
         await self.signals.send_catch_log_async(signal=signals.engine_started)
         if self._stopping:
             # band-aid until https://github.com/vex/vex/issues/6916
@@ -218,459 +363,338 @@ class ExecutionEngine:
 
         self.running = self._starting = False
         self._stopping = True
+        
+        # Record engine stop metric
+        self._record_metric('engine_stops_total', {'spider': self.spider.name if self.spider else 'unknown'})
+        
         if self._start_request_processing_awaitable is not None:
             if (
                 not is_asyncio_available()
-                or self._start_request_processing_awaitable
-                is not asyncio.current_task()
+                or not isinstance(self._start_request_processing_awaitable, asyncio.Future)
             ):
-                # If using the asyncio loop and stop_async() was called from
-                # start() itself, we can't cancel it, and _start_request_processing()
-                # will exit via the self.running check.
                 self._start_request_processing_awaitable.cancel()
-            self._start_request_processing_awaitable = None
-        if self.spider is not None:
-            await self.close_spider_async(reason="shutdown")
-        await self.signals.send_catch_log_async(signal=signals.engine_stopped)
-        if self._closewait:
-            self._closewait.callback(None)
-
-    def close(self) -> Deferred[None]:  # pragma: no cover
-        warnings.warn(
-            "ExecutionEngine.close() is deprecated, use close_async() instead",
-            ScrapyDeprecationWarning,
-            stacklevel=2,
-        )
-        return deferred_from_coro(self.close_async())
-
-    async def close_async(self) -> None:
-        """
-        Gracefully close the execution engine.
-        If it has already been started, stop it. In all cases, close the spider and the downloader.
-        """
-        if self.running:
-            await self.stop_async()  # will also close spider and downloader
-        elif self.spider is not None:
-            await self.close_spider_async(
-                reason="shutdown"
-            )  # will also close downloader
-        elif hasattr(self, "downloader"):
-            self.downloader.close()
-
-    def pause(self) -> None:
-        self.paused = True
-
-    def unpause(self) -> None:
-        self.paused = False
-
-    async def _process_start_next(self) -> None:
-        """Processes the next item or request from Spider.start().
-
-        If a request, it is scheduled. If an item, it is sent to item
-        pipelines.
-        """
-        assert self._start is not None
-        try:
-            item_or_request = await self._start.__anext__()
-        except StopAsyncIteration:
-            self._start = None
-        except Exception as exception:
-            self._start = None
-            exception_traceback = format_exc()
-            logger.error(
-                f"Error while reading start items and requests: {exception}.\n{exception_traceback}",
-                exc_info=True,
-            )
-        else:
-            if not self.spider:
-                return  # spider already closed
-            if isinstance(item_or_request, Request):
-                self.crawl(item_or_request)
             else:
-                assert self._slot is not None
-                _schedule_coro(
-                    self.scraper.start_itemproc_async(item_or_request, response=None)
-                )
-                self._slot.nextcall.schedule()
-
-    async def _start_request_processing(self) -> None:
-        """Starts consuming Spider.start() output and sending scheduled
-        requests."""
-        # Starts the processing of scheduled requests, as well as a periodic
-        # call to that processing method for scenarios where the scheduler
-        # reports having pending requests but returns none.
-        try:
-            assert self._slot is not None  # typing
-            self._slot.nextcall.schedule()
-            self._slot.heartbeat.start(self._SLOT_HEARTBEAT_INTERVAL)
-
-            while self._start and self.spider and self.running:
-                await self._process_start_next()
-                if not self.needs_backout():
-                    # Give room for the outcome of self._process_start_next() to be
-                    # processed before continuing with the next iteration.
-                    self._slot.nextcall.schedule()
-                    await self._slot.nextcall.wait()
-        except (asyncio.exceptions.CancelledError, CancelledError):
-            # self.stop_async() has cancelled us, nothing to do
-            return
-        except Exception:
-            # an error happened, log it and stop the engine
-            self._start_request_processing_awaitable = None
-            logger.error(
-                "Error while processing requests from start()",
-                exc_info=True,
-                extra={"spider": self.spider},
-            )
-            await self.stop_async()
-
-    def _start_scheduled_requests(self) -> None:
-        if self._slot is None or self._slot.closing is not None or self.paused:
-            return
-
-        while not self.needs_backout():
-            if not self._start_scheduled_request():
-                break
-
-        if self.spider_is_idle() and self._slot.close_if_idle:
-            self._spider_idle()
-
-    def needs_backout(self) -> bool:
-        """Returns ``True`` if no more requests can be sent at the moment, or
-        ``False`` otherwise.
-
-        See :ref:`start-requests-lazy` for an example.
-        """
-        assert self.scraper.slot is not None  # typing
-        return (
-            not self.running
-            or not self._slot
-            or bool(self._slot.closing)
-            or self.downloader.needs_backout()
-            or self.scraper.slot.needs_backout()
-        )
-
-    def _start_scheduled_request(self) -> bool:
-        assert self._slot is not None  # typing
-        assert self.spider is not None  # typing
-
-        request = self._slot.scheduler.next_request()
-        if request is None:
-            self.signals.send_catch_log(signals.scheduler_empty)
-            return False
-
-        d: Deferred[Response | Request] = self._download(request)
-        d.addBoth(self._handle_downloader_output, request)
-        d.addErrback(
-            lambda f: logger.info(
-                "Error while handling downloader output",
-                exc_info=failure_to_exc_info(f),
-                extra={"spider": self.spider},
-            )
-        )
-
-        def _remove_request(_: Any) -> None:
-            assert self._slot
-            self._slot.remove_request(request)
-
-        d2: Deferred[None] = d.addBoth(_remove_request)
-        d2.addErrback(
-            lambda f: logger.info(
-                "Error while removing request from slot",
-                exc_info=failure_to_exc_info(f),
-                extra={"spider": self.spider},
-            )
-        )
-        slot = self._slot
-        d2.addBoth(lambda _: slot.nextcall.schedule())
-        d2.addErrback(
-            lambda f: logger.info(
-                "Error while scheduling new request",
-                exc_info=failure_to_exc_info(f),
-                extra={"spider": self.spider},
-            )
-        )
-        return True
-
-    @inlineCallbacks
-    def _handle_downloader_output(
-        self, result: Request | Response | Failure, request: Request
-    ) -> Generator[Deferred[Any], Any, None]:
-        if not isinstance(result, (Request, Response, Failure)):
-            raise TypeError(
-                f"Incorrect type: expected Request, Response or Failure, got {type(result)}: {result!r}"
-            )
-
-        # downloader middleware can return requests (for example, redirects)
-        if isinstance(result, Request):
-            self.crawl(result)
-            return
-
-        try:
-            yield self.scraper.enqueue_scrape(result, request)
-        except Exception:
-            assert self.spider is not None
-            logger.error(
-                "Error while enqueuing scrape",
-                exc_info=True,
-                extra={"spider": self.spider},
-            )
-
-    def spider_is_idle(self) -> bool:
-        if self._slot is None:
-            raise RuntimeError("Engine slot not assigned")
-        if not self.scraper.slot.is_idle():  # type: ignore[union-attr]
-            return False
-        if self.downloader.active:  # downloader has pending requests
-            return False
-        if self._start is not None:  # not all start requests are handled
-            return False
-        return not self._slot.scheduler.has_pending_requests()
-
-    def crawl(self, request: Request) -> None:
-        """Inject the request into the spider <-> downloader pipeline"""
-        if self.spider is None:
-            raise RuntimeError(f"No open spider to crawl: {request}")
-        self._schedule_request(request)
-        self._slot.nextcall.schedule()  # type: ignore[union-attr]
-
-    def _schedule_request(self, request: Request) -> None:
-        request_scheduled_result = self.signals.send_catch_log(
-            signals.request_scheduled,
-            request=request,
-            spider=self.spider,
-            dont_log=IgnoreRequest,
-        )
-        for _, result in request_scheduled_result:
-            if isinstance(result, Failure) and isinstance(result.value, IgnoreRequest):
-                return
-        if not self._slot.scheduler.enqueue_request(request):  # type: ignore[union-attr]
-            self.signals.send_catch_log(
-                signals.request_dropped, request=request, spider=self.spider
-            )
-
-    def download(self, request: Request) -> Deferred[Response]:
-        """Return a Deferred which fires with a Response as result, only downloader middlewares are applied"""
-        warnings.warn(
-            "ExecutionEngine.download() is deprecated, use download_async() instead",
-            ScrapyDeprecationWarning,
-            stacklevel=2,
-        )
-        return deferred_from_coro(self.download_async(request))
-
-    async def download_async(self, request: Request) -> Response:
-        """Return a coroutine which fires with a Response as result.
-
-         Only downloader middlewares are applied.
-
-        .. versionadded:: 2.14
-        """
-        if self.spider is None:
-            raise RuntimeError(f"No open spider to crawl: {request}")
-        try:
-            response_or_request = await maybe_deferred_to_future(
-                self._download(request)
-            )
-        finally:
-            assert self._slot is not None
-            self._slot.remove_request(request)
-        if isinstance(response_or_request, Request):
-            return await self.download_async(response_or_request)
-        return response_or_request
-
-    @inlineCallbacks
-    def _download(
-        self, request: Request
-    ) -> Generator[Deferred[Any], Any, Response | Request]:
-        assert self._slot is not None  # typing
-        assert self.spider is not None
-
-        self._slot.add_request(request)
-        try:
-            result: Response | Request
-            if self._downloader_fetch_needs_spider:
-                result = yield self.downloader.fetch(request, self.spider)
-            else:
-                result = yield self.downloader.fetch(request)
-            if not isinstance(result, (Response, Request)):
-                raise TypeError(
-                    f"Incorrect type: expected Response or Request, got {type(result)}: {result!r}"
-                )
-            if isinstance(result, Response):
-                if result.request is None:
-                    result.request = request
-                logkws = self.logformatter.crawled(result.request, result, self.spider)
-                if logkws is not None:
-                    logger.log(
-                        *logformatter_adapter(logkws), extra={"spider": self.spider}
-                    )
-                self.signals.send_catch_log(
-                    signal=signals.response_received,
-                    response=result,
-                    request=result.request,
-                    spider=self.spider,
-                )
-            return result
-        finally:
-            self._slot.nextcall.schedule()
-
-    def open_spider(
-        self, spider: Spider, close_if_idle: bool = True
-    ) -> Deferred[None]:  # pragma: no cover
-        warnings.warn(
-            "ExecutionEngine.open_spider() is deprecated, use open_spider_async() instead",
-            ScrapyDeprecationWarning,
-            stacklevel=2,
-        )
-        return deferred_from_coro(self.open_spider_async(close_if_idle=close_if_idle))
-
-    async def open_spider_async(self, *, close_if_idle: bool = True) -> None:
-        assert self.crawler.spider
+                # For asyncio futures, we need to handle cancellation differently
+                self._start_request_processing_awaitable.cancel()
+                try:
+                    await self._start_request_processing_awaitable
+                except asyncio.CancelledError:
+                    pass
+        
         if self._slot is not None:
-            raise RuntimeError(
-                f"No free spider slot when opening {self.crawler.spider.name!r}"
-            )
-        logger.info("Spider opened", extra={"spider": self.crawler.spider})
-        self.spider = self.crawler.spider
-        nextcall = CallLaterOnce(self._start_scheduled_requests)
-        scheduler = build_from_crawler(self.scheduler_cls, self.crawler)
-        self._slot = _Slot(close_if_idle, nextcall, scheduler)
-        self._start = await self.scraper.spidermw.process_start()
-        if hasattr(scheduler, "open") and (d := scheduler.open(self.crawler.spider)):
-            await maybe_deferred_to_future(d)
-        await self.scraper.open_spider_async()
-        assert self.crawler.stats
-        if argument_is_required(self.crawler.stats.open_spider, "spider"):
-            warnings.warn(
-                f"The open_spider() method of {global_object_name(type(self.crawler.stats))} requires a spider argument,"
-                f" this is deprecated and the argument will not be passed in future Scrapy versions.",
-                ScrapyDeprecationWarning,
-                stacklevel=2,
-            )
-            self.crawler.stats.open_spider(spider=self.crawler.spider)
-        else:
-            self.crawler.stats.open_spider()
-        await self.signals.send_catch_log_async(
-            signals.spider_opened, spider=self.crawler.spider
-        )
-
-    def _spider_idle(self) -> None:
-        """
-        Called when a spider gets idle, i.e. when there are no remaining requests to download or schedule.
-        It can be called multiple times. If a handler for the spider_idle signal raises a DontCloseSpider
-        exception, the spider is not closed until the next loop and this function is guaranteed to be called
-        (at least) once again. A handler can raise CloseSpider to provide a custom closing reason.
-        """
-        assert self.spider is not None  # typing
-        expected_ex = (DontCloseSpider, CloseSpider)
-        res = self.signals.send_catch_log(
-            signals.spider_idle, spider=self.spider, dont_log=expected_ex
-        )
-        detected_ex = {
-            ex: x.value
-            for _, x in res
-            for ex in expected_ex
-            if isinstance(x, Failure) and isinstance(x.value, ex)
-        }
-        if DontCloseSpider in detected_ex:
-            return
-        if self.spider_is_idle():
-            ex = detected_ex.get(CloseSpider, CloseSpider(reason="finished"))
-            assert isinstance(ex, CloseSpider)  # typing
-            _schedule_coro(self.close_spider_async(reason=ex.reason))
-
-    def close_spider(
-        self, spider: Spider, reason: str = "cancelled"
-    ) -> Deferred[None]:  # pragma: no cover
-        warnings.warn(
-            "ExecutionEngine.close_spider() is deprecated, use close_spider_async() instead",
-            ScrapyDeprecationWarning,
-            stacklevel=2,
-        )
-        return deferred_from_coro(self.close_spider_async(reason=reason))
-
-    async def close_spider_async(self, *, reason: str = "cancelled") -> None:  # noqa: PLR0912
-        """Close (cancel) spider and clear all its outstanding requests.
-
-        .. versionadded:: 2.14
-        """
-        if self.spider is None:
-            raise RuntimeError("Spider not opened")
-
-        if self._slot is None:
-            raise RuntimeError("Engine slot not assigned")
-
-        if self._slot.closing is not None:
-            await maybe_deferred_to_future(self._slot.closing)
-            return
-
-        spider = self.spider
-
-        logger.info(
-            "Closing spider (%(reason)s)", {"reason": reason}, extra={"spider": spider}
-        )
-
-        def log_failure(msg: str) -> None:
-            logger.error(msg, exc_info=True, extra={"spider": spider})  # noqa: LOG014
-
-        try:
             await self._slot.close()
-        except Exception:
-            log_failure("Slot close failure")
-
-        try:
-            self.downloader.close()
-        except Exception:
-            log_failure("Downloader close failure")
-
-        try:
-            await self.scraper.close_spider_async()
-        except Exception:
-            log_failure("Scraper close failure")
-
-        if hasattr(self._slot.scheduler, "close"):
+            self._slot = None
+        
+        # Send engine stopped signal
+        await self.signals.send_catch_log_async(signal=signals.engine_stopped)
+        
+        if self._closewait is not None:
+            self._closewait.callback(None)
+            self._closewait = None
+    
+    async def _start_request_processing(self) -> None:
+        """Start processing requests from the scheduler."""
+        if self._slot is None:
+            return
+        
+        # Record scheduler queue size
+        if self._metrics_enabled and self.spider:
             try:
-                if (d := self._slot.scheduler.close(reason)) is not None:
-                    await maybe_deferred_to_future(d)
+                queue_size = await maybe_deferred_to_future(
+                    self._slot.scheduler.has_pending_requests()
+                )
+                if queue_size:
+                    self._record_metric(
+                        'scheduler_queue_size',
+                        {'spider': self.spider.name},
+                        value=0  # Will be set by gauge
+                    )
             except Exception:
-                log_failure("Scheduler close failure")
-
-        try:
-            await self.signals.send_catch_log_async(
-                signal=signals.spider_closed,
-                spider=spider,
-                reason=reason,
-            )
-        except Exception:
-            log_failure("Error while sending spider_close signal")
-
-        assert self.crawler.stats
-        try:
-            if argument_is_required(self.crawler.stats.close_spider, "spider"):
-                warnings.warn(
-                    f"The close_spider() method of {global_object_name(type(self.crawler.stats))} requires a spider argument,"
-                    f" this is deprecated and the argument will not be passed in future Scrapy versions.",
-                    ScrapyDeprecationWarning,
-                    stacklevel=2,
-                )
-                self.crawler.stats.close_spider(
-                    spider=self.crawler.spider, reason=reason
-                )
-            else:
-                self.crawler.stats.close_spider(reason=reason)
-        except Exception:
-            log_failure("Stats close failure")
-
-        logger.info(
-            "Spider closed (%(reason)s)",
-            {"reason": reason},
-            extra={"spider": spider},
+                pass
+        
+        # Process next request
+        await self._process_next_request()
+    
+    async def _process_next_request(self) -> None:
+        """Process the next request from the scheduler."""
+        if not self.running or self.paused or self._slot is None:
+            return
+        
+        # Get next request from scheduler
+        request = await maybe_deferred_to_future(
+            self._slot.scheduler.next_request()
         )
-
-        self._slot = None
-        self.spider = None
-
+        
+        if request is None:
+            # No more requests, schedule next check
+            self._slot.nextcall.schedule()
+            return
+        
+        # Process the request
+        await self._download(request)
+    
+    async def _download(self, request: Request) -> None:
+        """Download a request and process the response."""
+        if not self.running or self._slot is None:
+            return
+        
+        spider = self.spider
+        if spider is None:
+            return
+        
+        # Add request to in-progress set
+        self._slot.add_request(request)
+        
+        # Record active requests metric
+        self._record_metric(
+            'active_requests',
+            {'spider': spider.name},
+            value=len(self._slot.inprogress)
+        )
+        
+        # Create tracing span for download
+        span = self._create_span(
+            'download_request',
+            {
+                'http.url': request.url,
+                'http.method': request.method,
+                'spider.name': spider.name,
+            }
+        )
+        
+        start_time = time()
+        
         try:
-            await ensure_awaitable(self._spider_closed_callback(spider))
-        except Exception:
-            log_failure("Error running spider_closed_callback")
+            # Download the request
+            response = await maybe_deferred_to_future(
+                self.downloader.fetch(request, spider)
+            )
+            
+            # Record metrics
+            duration = time() - start_time
+            self._record_metric(
+                'requests_total',
+                {
+                    'spider': spider.name,
+                    'method': request.method,
+                    'status': str(response.status)
+                }
+            )
+            self._record_metric(
+                'request_duration_seconds',
+                {
+                    'spider': spider.name,
+                    'method': request.method
+                },
+                value=duration
+            )
+            
+            # Log request for replay
+            self._log_request_for_replay(request, response)
+            
+            # Send signal for live dashboard
+            await self.signals.send_catch_log_async(
+                signal=signals.request_downloaded,
+                request=request,
+                response=response,
+                spider=spider
+            )
+            
+            # Check for anomalies
+            if self._anomaly_detector:
+                await self._anomaly_detector.analyze_response(request, response)
+            
+            # Process the response
+            await self._scrape(response, request, spider)
+            
+        except Exception as e:
+            # Record error metric
+            self._record_metric(
+                'errors_total',
+                {
+                    'spider': spider.name,
+                    'error_type': type(e).__name__
+                }
+            )
+            
+            # Log error for replay
+            self._log_request_for_replay(request, error=e)
+            
+            # Send error signal
+            await self.signals.send_catch_log_async(
+                signal=signals.request_error,
+                request=request,
+                exception=e,
+                spider=spider
+            )
+            
+            # Check for anomalies
+            if self._anomaly_detector:
+                await self._anomaly_detector.analyze_error(request, e)
+            
+            # Handle the error
+            await self._handle_download_error(request, e, spider)
+            
+        finally:
+            # End tracing span
+            if span:
+                span.end()
+            
+            # Remove from in-progress
+            self._slot.remove_request(request)
+            
+            # Record active requests metric
+            self._record_metric(
+                'active_requests',
+                {'spider': spider.name},
+                value=len(self._slot.inprogress)
+            )
+    
+    async def _scrape(self, response: Response, request: Request, spider: Spider) -> None:
+        """Scrape a response."""
+        # Create tracing span for scraping
+        span = self._create_span(
+            'scrape_response',
+            {
+                'http.url': response.url,
+                'http.status_code': response.status,
+                'spider.name': spider.name,
+            }
+        )
+        
+        try:
+            # Scrape the response
+            await maybe_deferred_to_future(
+                self.scraper.enqueue_scrape(response, request, spider)
+            )
+            
+        except Exception as e:
+            # Record error metric
+            self._record_metric(
+                'errors_total',
+                {
+                    'spider': spider.name,
+                    'error_type': f'scrape_{type(e).__name__}'
+                }
+            )
+            
+            # Send error signal
+            await self.signals.send_catch_log_async(
+                signal=signals.spider_error,
+                request=request,
+                response=response,
+                exception=e,
+                spider=spider
+            )
+            
+        finally:
+            # End tracing span
+            if span:
+                span.end()
+    
+    async def _handle_download_error(self, request: Request, exception: Exception, spider: Spider) -> None:
+        """Handle download errors."""
+        # Log the error
+        logger.error(
+            "Error downloading %(request)s: %(error)s",
+            {'request': request, 'error': exception},
+            exc_info=failure_to_exc_info(Failure(exception)),
+            extra={'spider': spider}
+        )
+        
+        # Send signal for error handling
+        await self.signals.send_catch_log_async(
+            signal=signals.request_dropped,
+            request=request,
+            spider=spider
+        )
+    
+    def replay_request(self, request_data: dict) -> Deferred:
+        """
+        Replay a request from logged data.
+        
+        Args:
+            request_data: Dictionary containing request details from _log_request_for_replay
+            
+        Returns:
+            Deferred that fires when request is scheduled
+        """
+        if not self.running or self.spider is None:
+            raise RuntimeError("Engine not running or no spider available")
+        
+        # Reconstruct request from log data
+        request = Request(
+            url=request_data['url'],
+            method=request_data['method'],
+            headers=request_data.get('headers', {}),
+            body=request_data.get('body'),
+            meta=request_data.get('meta', {}),
+            callback=self._replay_callback,
+            errback=self._replay_errback,
+        )
+        
+        # Mark as replayed request
+        request.meta['replayed'] = True
+        request.meta['original_timestamp'] = request_data.get('timestamp')
+        
+        # Schedule the request
+        d = self._slot.scheduler.enqueue_request(request)
+        
+        # Send signal for replay
+        self.signals.send_catch_log(
+            signal=signals.request_replayed,
+            request=request,
+            spider=self.spider
+        )
+        
+        return d
+    
+    def _replay_callback(self, response: Response) -> None:
+        """Callback for replayed requests."""
+        logger.info("Replayed request completed: %s", response.url)
+    
+    def _replay_errback(self, failure: Failure) -> None:
+        """Errback for replayed requests."""
+        logger.error("Replayed request failed: %s", failure.value)
+    
+    def get_request_log(self, limit: int = 100) -> list:
+        """
+        Get recent request log entries.
+        
+        Args:
+            limit: Maximum number of entries to return
+            
+        Returns:
+            List of request log entries
+        """
+        return self._request_log[-limit:]
+    
+    def get_metrics(self) -> dict:
+        """
+        Get current metrics snapshot.
+        
+        Returns:
+            Dictionary of metric names and values
+        """
+        if not self._metrics_enabled:
+            return {}
+        
+        metrics_snapshot = {}
+        for name, metric in self._metrics.items():
+            # This is a simplified version - in production you'd use
+            # prometheus_client's generate_latest() or similar
+            metrics_snapshot[name] = "See Prometheus endpoint for values"
+        
+        return metrics_snapshot
+    
+    def get_anomaly_report(self) -> dict:
+        """
+        Get anomaly detection report.
+        
+        Returns:
+            Dictionary with anomaly analysis
+        """
+        if not self._anomaly_detector:
+            return {'enabled': False}
+        
+        return self._anomaly_detector.get_report()

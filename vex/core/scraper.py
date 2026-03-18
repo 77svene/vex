@@ -3,18 +3,26 @@ extracts information from them"""
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import json
 import logging
+import pickle
+import random
+import socket
+import struct
+import time
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeVar
-import random
-import numpy as np
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, TypeAlias, TypeVar
 from urllib.parse import urlparse
-import hashlib
-from datetime import datetime, timedelta
 
 from twisted.internet.defer import Deferred, inlineCallbacks
+from twisted.internet import reactor, endpoints
+from twisted.internet.protocol import DatagramProtocol, Factory, Protocol
 from twisted.python.failure import Failure
 
 from vex import Spider, signals
@@ -61,372 +69,460 @@ _T = TypeVar("_T")
 QueueTuple: TypeAlias = tuple[Response | Failure, Request, Deferred[None]]
 
 
-class PredictiveCrawlingEngine:
-    """AI-powered crawling engine with reinforcement learning for URL prioritization"""
+# ==================== DISTRIBUTED ORCHESTRATOR ====================
+
+class NodeState(Enum):
+    FOLLOWER = "follower"
+    CANDIDATE = "candidate"
+    LEADER = "leader"
+
+
+@dataclass
+class NodeInfo:
+    node_id: str
+    host: str
+    port: int
+    last_seen: float = field(default_factory=time.time)
+    state: NodeState = NodeState.FOLLOWER
+    term: int = 0
+
+
+class ConsistentHashRing:
+    """Consistent hashing with virtual nodes for URL sharding"""
     
-    def __init__(self, crawler: Crawler):
+    def __init__(self, nodes: List[str], replicas: int = 100):
+        self.replicas = replicas
+        self.ring: Dict[int, str] = {}
+        self.sorted_keys: List[int] = []
+        self.nodes = set()
+        
+        for node in nodes:
+            self.add_node(node)
+    
+    def _hash(self, key: str) -> int:
+        return int(hashlib.md5(key.encode()).hexdigest(), 16)
+    
+    def add_node(self, node: str):
+        self.nodes.add(node)
+        for i in range(self.replicas):
+            key = self._hash(f"{node}:{i}")
+            self.ring[key] = node
+            self.sorted_keys.append(key)
+        self.sorted_keys.sort()
+    
+    def remove_node(self, node: str):
+        self.nodes.discard(node)
+        for i in range(self.replicas):
+            key = self._hash(f"{node}:{i}")
+            self.ring.pop(key, None)
+            self.sorted_keys.remove(key)
+    
+    def get_node(self, key: str) -> Optional[str]:
+        if not self.ring:
+            return None
+        
+        hash_key = self._hash(key)
+        for ring_key in self.sorted_keys:
+            if hash_key <= ring_key:
+                return self.ring[ring_key]
+        
+        return self.ring[self.sorted_keys[0]]
+
+
+class GossipProtocol(DatagramProtocol):
+    """Gossip protocol for node discovery and failure detection"""
+    
+    def __init__(self, orchestrator: 'DistributedOrchestrator'):
+        self.orchestrator = orchestrator
+        self.transport = None
+        self.gossip_interval = 5.0  # seconds
+        self.suspect_timeout = 15.0  # seconds
+        self.dead_timeout = 30.0  # seconds
+        
+    def startProtocol(self):
+        self.transport = self.transport
+        self._start_gossip_loop()
+    
+    def _start_gossip_loop(self):
+        self._gossip()
+        reactor.callLater(self.gossip_interval, self._start_gossip_loop)
+    
+    def _gossip(self):
+        """Send gossip messages to random nodes"""
+        nodes = list(self.orchestrator.nodes.values())
+        if not nodes:
+            return
+        
+        # Select random nodes to gossip with
+        gossip_targets = random.sample(nodes, min(3, len(nodes)))
+        
+        for target in gossip_targets:
+            if target.node_id != self.orchestrator.node_id:
+                self._send_gossip(target)
+    
+    def _send_gossip(self, target: NodeInfo):
+        """Send gossip message to a node"""
+        message = {
+            'type': 'gossip',
+            'node_id': self.orchestrator.node_id,
+            'nodes': {nid: {'host': n.host, 'port': n.port, 'last_seen': n.last_seen, 
+                           'state': n.state.value, 'term': n.term}
+                     for nid, n in self.orchestrator.nodes.items()},
+            'term': self.orchestrator.current_term,
+            'leader_id': self.orchestrator.leader_id
+        }
+        
+        data = pickle.dumps(message)
+        self.transport.write(data, (target.host, target.port))
+    
+    def datagramReceived(self, data, addr):
+        """Handle incoming gossip messages"""
+        try:
+            message = pickle.loads(data)
+            msg_type = message.get('type')
+            
+            if msg_type == 'gossip':
+                self._handle_gossip(message, addr)
+            elif msg_type == 'heartbeat':
+                self._handle_heartbeat(message)
+            elif msg_type == 'election':
+                self._handle_election(message)
+            elif msg_type == 'vote':
+                self._handle_vote(message)
+            elif msg_type == 'url_assignment':
+                self._handle_url_assignment(message)
+                
+        except Exception as e:
+            logger.error(f"Error processing gossip message: {e}")
+    
+    def _handle_gossip(self, message, addr):
+        """Process gossip message and update node list"""
+        sender_id = message['node_id']
+        
+        # Update sender's last seen
+        if sender_id in self.orchestrator.nodes:
+            self.orchestrator.nodes[sender_id].last_seen = time.time()
+        else:
+            # New node discovered
+            self.orchestrator._add_node(sender_id, addr[0], message.get('port', 6800))
+        
+        # Merge node information
+        for node_id, node_data in message.get('nodes', {}).items():
+            if node_id != self.orchestrator.node_id:
+                if node_id not in self.orchestrator.nodes:
+                    self.orchestrator._add_node(node_id, node_data['host'], node_data['port'])
+                
+                node = self.orchestrator.nodes[node_id]
+                node.last_seen = max(node.last_seen, node_data['last_seen'])
+                node.state = NodeState(node_data['state'])
+                node.term = node_data['term']
+        
+        # Update leader information
+        if message.get('leader_id'):
+            self.orchestrator.leader_id = message['leader_id']
+            self.orchestrator.current_term = max(self.orchestrator.current_term, message['term'])
+    
+    def _handle_heartbeat(self, message):
+        """Handle heartbeat from leader"""
+        if message['term'] >= self.orchestrator.current_term:
+            self.orchestrator.current_term = message['term']
+            self.orchestrator.leader_id = message['node_id']
+            self.orchestrator.election_timeout = time.time() + random.uniform(10, 20)
+    
+    def _handle_election(self, message):
+        """Handle election request"""
+        if message['term'] > self.orchestrator.current_term:
+            self.orchestrator.current_term = message['term']
+            self.orchestrator.state = NodeState.FOLLOWER
+            self.orchestrator.voted_for = None
+        
+        if (message['term'] == self.orchestrator.current_term and 
+            self.orchestrator.state == NodeState.FOLLOWER and
+            self.orchestrator.voted_for in (None, message['node_id'])):
+            
+            # Grant vote
+            vote_message = {
+                'type': 'vote',
+                'node_id': self.orchestrator.node_id,
+                'term': self.orchestrator.current_term,
+                'candidate_id': message['node_id'],
+                'granted': True
+            }
+            
+            target = self.orchestrator.nodes.get(message['node_id'])
+            if target:
+                data = pickle.dumps(vote_message)
+                self.transport.write(data, (target.host, target.port))
+            
+            self.orchestrator.voted_for = message['node_id']
+    
+    def _handle_vote(self, message):
+        """Handle vote response"""
+        if (message['term'] == self.orchestrator.current_term and
+            message['candidate_id'] == self.orchestrator.node_id and
+            message['granted']):
+            
+            self.orchestrator.votes_received.add(message['node_id'])
+            
+            # Check if we have majority
+            majority = len(self.orchestrator.nodes) // 2 + 1
+            if len(self.orchestrator.votes_received) >= majority:
+                self.orchestrator._become_leader()
+    
+    def _handle_url_assignment(self, message):
+        """Handle URL assignment from leader"""
+        if message['term'] >= self.orchestrator.current_term:
+            self.orchestrator.url_assignments = message['assignments']
+            self.orchestrator.hash_ring = ConsistentHashRing(
+                list(self.orchestrator.url_assignments.keys())
+            )
+
+
+class RaftElectionProtocol:
+    """Raft consensus protocol for coordinator election"""
+    
+    def __init__(self, orchestrator: 'DistributedOrchestrator'):
+        self.orchestrator = orchestrator
+        self.election_interval = 1.0  # seconds
+    
+    def start(self):
+        """Start election monitoring"""
+        self._monitor_election()
+    
+    def _monitor_election(self):
+        """Monitor election timeout and start election if needed"""
+        if (self.orchestrator.state != NodeState.LEADER and 
+            time.time() > self.orchestrator.election_timeout):
+            self._start_election()
+        
+        reactor.callLater(self.election_interval, self._monitor_election)
+    
+    def _start_election(self):
+        """Start leader election"""
+        self.orchestrator.state = NodeState.CANDIDATE
+        self.orchestrator.current_term += 1
+        self.orchestrator.voted_for = self.orchestrator.node_id
+        self.orchestrator.votes_received = {self.orchestrator.node_id}
+        self.orchestrator.election_timeout = time.time() + random.uniform(10, 20)
+        
+        # Request votes from other nodes
+        election_message = {
+            'type': 'election',
+            'node_id': self.orchestrator.node_id,
+            'term': self.orchestrator.current_term,
+            'last_log_index': 0,  # Simplified
+            'last_log_term': 0    # Simplified
+        }
+        
+        for node_id, node in self.orchestrator.nodes.items():
+            if node_id != self.orchestrator.node_id:
+                data = pickle.dumps(election_message)
+                self.orchestrator.gossip_transport.write(data, (node.host, node.port))
+
+
+class DistributedOrchestrator:
+    """Main distributed orchestrator with Raft, gossip, and consistent hashing"""
+    
+    def __init__(self, crawler: 'Crawler'):
         self.crawler = crawler
         self.settings = crawler.settings
         
-        # Multi-armed bandit parameters for URL prioritization
-        self.url_rewards: dict[str, list[float]] = {}  # url_pattern -> [rewards]
-        self.url_counts: dict[str, int] = {}  # url_pattern -> visit count
-        self.url_success: dict[str, int] = {}  # url_pattern -> success count
+        # Node identification
+        self.node_id = self._generate_node_id()
+        self.host = self.settings.get('DISTRIBUTED_HOST', 'localhost')
+        self.port = self.settings.getint('DISTRIBUTED_PORT', 6800)
         
-        # LSTM model parameters (simplified for implementation)
-        self.site_patterns: dict[str, list[str]] = {}  # domain -> [url_patterns]
-        self.pattern_embeddings: dict[str, np.ndarray] = {}  # pattern -> embedding
-        self.sequence_length = 10  # LSTM sequence length
+        # State
+        self.state = NodeState.FOLLOWER
+        self.current_term = 0
+        self.voted_for = None
+        self.leader_id = None
+        self.election_timeout = time.time() + random.uniform(10, 20)
+        self.votes_received: Set[str] = set()
         
-        # Politeness policies
-        self.domain_politeness: dict[str, dict] = {}  # domain -> politeness settings
-        self.domain_delays: dict[str, float] = {}  # domain -> current delay
-        self.domain_error_counts: dict[str, int] = {}  # domain -> error count
+        # Node management
+        self.nodes: Dict[str, NodeInfo] = {}
+        self._add_node(self.node_id, self.host, self.port)
         
-        # Reward function weights
-        self.data_quality_weight = self.settings.getfloat('PREDICTIVE_DATA_QUALITY_WEIGHT', 0.6)
-        self.freshness_weight = self.settings.getfloat('PREDICTIVE_FRESHNESS_WEIGHT', 0.3)
-        self.bandwidth_weight = self.settings.getfloat('PREDICTIVE_BANDWIDTH_WEIGHT', 0.1)
+        # URL sharding
+        self.hash_ring: Optional[ConsistentHashRing] = None
+        self.url_assignments: Dict[str, List[str]] = {}  # node_id -> list of URL patterns
         
-        # Statistics
-        self.total_requests = 0
-        self.successful_requests = 0
-        self.bandwidth_saved = 0
-        self.data_yield = 0
+        # Request deduplication
+        self.seen_requests: Set[str] = set()
+        self.request_ttl = 3600  # 1 hour
         
-        # Initialize with default values
-        self._initialize_defaults()
+        # Protocols
+        self.gossip_protocol = GossipProtocol(self)
+        self.election_protocol = RaftElectionProtocol(self)
+        self.gossip_transport = None
+        
+        # Start distributed components
+        self._start_gossip()
+        self.election_protocol.start()
+        
+        # Start periodic cleanup
+        self._start_cleanup()
     
-    def _initialize_defaults(self):
-        """Initialize default values for the predictive engine"""
-        # Default politeness settings
-        self.default_delay = self.settings.getfloat('DOWNLOAD_DELAY', 1.0)
-        self.min_delay = self.settings.getfloat('PREDICTIVE_MIN_DELAY', 0.5)
-        self.max_delay = self.settings.getfloat('PREDICTIVE_MAX_DELAY', 10.0)
-        
-        # Bandit exploration parameters
-        self.exploration_rate = self.settings.getfloat('PREDICTIVE_EXPLORATION_RATE', 0.1)
-        self.ucb_c = self.settings.getfloat('PREDICTIVE_UCB_C', 2.0)  # UCB exploration constant
-        
-        # LSTM training parameters
-        self.lstm_training_enabled = self.settings.getbool('PREDICTIVE_LSTM_TRAINING', True)
-        self.lstm_update_frequency = self.settings.getint('PREDICTIVE_LSTM_UPDATE_FREQ', 100)
-        self.request_counter = 0
-        
-        # Bandwidth optimization target
-        self.bandwidth_reduction_target = self.settings.getfloat('PREDICTIVE_BANDWIDTH_TARGET', 0.6)
+    def _generate_node_id(self) -> str:
+        """Generate unique node ID"""
+        hostname = socket.gethostname()
+        pid = str(os.getpid()) if 'os' in globals() else str(random.randint(1000, 9999))
+        return hashlib.md5(f"{hostname}:{pid}:{time.time()}".encode()).hexdigest()[:8]
     
-    def _get_url_pattern(self, url: str) -> str:
-        """Extract URL pattern for grouping similar URLs"""
-        parsed = urlparse(url)
-        # Create pattern by normalizing path segments
-        path_parts = parsed.path.split('/')
-        normalized_parts = []
-        for part in path_parts:
-            if part.isdigit():
-                normalized_parts.append('{id}')
-            elif part and len(part) > 20:  # Likely a hash or encoded string
-                normalized_parts.append('{hash}')
-            else:
-                normalized_parts.append(part)
-        
-        pattern = f"{parsed.netloc}/{'/'.join(normalized_parts)}"
-        return hashlib.md5(pattern.encode()).hexdigest()[:16]  # Short hash for pattern
-    
-    def _get_domain(self, url: str) -> str:
-        """Extract domain from URL"""
-        return urlparse(url).netloc
-    
-    def _calculate_reward(self, request: Request, response: Response, items: list, 
-                         processing_time: float) -> float:
-        """Calculate reward based on data quality, freshness, and bandwidth efficiency"""
-        reward = 0.0
-        
-        # Data quality component (items extracted, response size, content type)
-        data_quality = 0.0
-        if items:
-            data_quality += min(len(items) * 0.2, 1.0)  # Cap at 1.0
-        
-        # Check for valuable content indicators
-        if response.css('article, .content, .post, .product, .item'):
-            data_quality += 0.3
-        
-        # Response size factor (prefer substantial content)
-        content_size = len(response.body)
-        if content_size > 1000:  # At least 1KB
-            data_quality += min(content_size / 10000, 0.5)  # Up to 0.5 bonus
-        
-        reward += data_quality * self.data_quality_weight
-        
-        # Freshness component (based on response headers or content)
-        freshness = 0.0
-        last_modified = response.headers.get('Last-Modified')
-        if last_modified:
-            try:
-                # Simple freshness check - more recent = higher reward
-                freshness = 0.5
-            except:
-                pass
-        
-        # Check for date patterns in content
-        if response.css('time, .date, .timestamp, [datetime]'):
-            freshness += 0.3
-        
-        reward += freshness * self.freshness_weight
-        
-        # Bandwidth efficiency component
-        bandwidth_efficiency = 0.0
-        expected_size = self._predict_response_size(request.url)
-        if expected_size > 0:
-            # Reward if actual size is smaller than predicted (bandwidth saved)
-            size_ratio = content_size / expected_size
-            if size_ratio < 1.0:
-                bandwidth_efficiency = (1.0 - size_ratio) * 2.0  # Double reward for savings
-        
-        reward += bandwidth_efficiency * self.bandwidth_weight
-        
-        # Penalty for errors or empty responses
-        if response.status >= 400:
-            reward -= 0.5
-        elif not items and content_size < 500:
-            reward -= 0.3
-        
-        return max(0.0, min(1.0, reward))  # Normalize to [0, 1]
-    
-    def _predict_response_size(self, url: str) -> int:
-        """Predict response size based on URL pattern history"""
-        pattern = self._get_url_pattern(url)
-        if pattern in self.url_rewards and self.url_counts.get(pattern, 0) > 0:
-            # Use historical average
-            avg_reward = np.mean(self.url_rewards[pattern])
-            # Convert reward to estimated size (higher reward = larger content)
-            return int(5000 * avg_reward)  # Base 5KB scaled by reward
-        return 5000  # Default prediction
-    
-    def _update_bandit(self, url: str, reward: float):
-        """Update multi-armed bandit with reward"""
-        pattern = self._get_url_pattern(url)
-        
-        if pattern not in self.url_rewards:
-            self.url_rewards[pattern] = []
-            self.url_counts[pattern] = 0
-            self.url_success[pattern] = 0
-        
-        self.url_rewards[pattern].append(reward)
-        self.url_counts[pattern] += 1
-        
-        if reward > 0.5:  # Consider it a success
-            self.url_success[pattern] += 1
-        
-        # Keep only recent rewards (sliding window)
-        if len(self.url_rewards[pattern]) > 100:
-            self.url_rewards[pattern] = self.url_rewards[pattern][-100:]
-    
-    def _calculate_url_priority(self, url: str, depth: int = 0) -> float:
-        """Calculate URL priority using UCB1 algorithm"""
-        pattern = self._get_url_pattern(url)
-        domain = self._get_domain(url)
-        
-        # Base priority from exploration-exploitation tradeoff
-        if pattern not in self.url_counts or self.url_counts[pattern] == 0:
-            # Unexplored URL - high priority
-            base_priority = 1.0
-        else:
-            # UCB1 algorithm
-            total_counts = sum(self.url_counts.values())
-            if total_counts == 0:
-                total_counts = 1
+    def _add_node(self, node_id: str, host: str, port: int):
+        """Add a new node to the cluster"""
+        if node_id not in self.nodes:
+            self.nodes[node_id] = NodeInfo(node_id=node_id, host=host, port=port)
+            logger.info(f"Node discovered: {node_id} at {host}:{port}")
             
-            avg_reward = np.mean(self.url_rewards.get(pattern, [0.5]))
-            exploration_bonus = self.ucb_c * np.sqrt(
-                np.log(total_counts) / self.url_counts[pattern]
-            )
-            base_priority = avg_reward + exploration_bonus
-        
-        # Adjust for depth (prefer shallower pages initially)
-        depth_factor = 1.0 / (1.0 + depth * 0.1)
-        
-        # Adjust for domain politeness
-        domain_delay = self.domain_delays.get(domain, self.default_delay)
-        politeness_factor = 1.0 / (1.0 + domain_delay * 0.5)
-        
-        # Adjust for predicted value using LSTM-like pattern matching
-        pattern_value = self._predict_pattern_value(pattern, domain)
-        
-        final_priority = base_priority * depth_factor * politeness_factor * pattern_value
-        
-        # Add some randomness for exploration
-        if random.random() < self.exploration_rate:
-            final_priority *= random.uniform(0.5, 1.5)
-        
-        return max(0.1, min(1.0, final_priority))  # Clamp to reasonable range
+            # Update hash ring if we're the leader
+            if self.state == NodeState.LEADER:
+                self._rebalance_urls()
     
-    def _predict_pattern_value(self, pattern: str, domain: str) -> float:
-        """Predict value of URL pattern using LSTM-like sequence modeling"""
-        if domain not in self.site_patterns:
-            self.site_patterns[domain] = []
-        
-        # Add pattern to domain history
-        if pattern not in self.site_patterns[domain]:
-            self.site_patterns[domain].append(pattern)
-        
-        # Keep only recent patterns
-        if len(self.site_patterns[domain]) > self.sequence_length * 2:
-            self.site_patterns[domain] = self.site_patterns[domain][-self.sequence_length * 2:]
-        
-        # Simple sequence prediction: patterns that follow successful patterns are valuable
-        if len(self.site_patterns[domain]) >= 2:
-            # Check if this pattern follows a successful pattern
-            for i in range(len(self.site_patterns[domain]) - 1):
-                prev_pattern = self.site_patterns[domain][i]
-                if prev_pattern in self.url_success and self.url_success[prev_pattern] > 0:
-                    # Pattern follows a successful pattern - likely valuable
-                    return 1.2
-        
-        # Default value
-        return 1.0
-    
-    def _update_politeness(self, domain: str, response: Response, processing_time: float):
-        """Dynamically adjust politeness policies based on site behavior"""
-        if domain not in self.domain_politeness:
-            self.domain_politeness[domain] = {
-                'base_delay': self.default_delay,
-                'consecutive_errors': 0,
-                'last_adjustment': datetime.now()
-            }
-        
-        politeness = self.domain_politeness[domain]
-        
-        # Check for rate limiting or errors
-        if response.status == 429:  # Too Many Requests
-            politeness['consecutive_errors'] += 1
-            # Exponential backoff
-            new_delay = politeness['base_delay'] * (2 ** politeness['consecutive_errors'])
-            politeness['base_delay'] = min(new_delay, self.max_delay)
-            logger.info(f"Increased delay for {domain} to {politeness['base_delay']}s due to rate limiting")
-        
-        elif response.status >= 500:
-            politeness['consecutive_errors'] += 1
-            # Moderate backoff for server errors
-            politeness['base_delay'] = min(politeness['base_delay'] * 1.5, self.max_delay)
-        
-        elif response.status == 200:
-            # Successful request - gradually reduce delay if we've been polite
-            if politeness['consecutive_errors'] > 0:
-                politeness['consecutive_errors'] = max(0, politeness['consecutive_errors'] - 1)
+    def _remove_node(self, node_id: str):
+        """Remove a node from the cluster"""
+        if node_id in self.nodes:
+            del self.nodes[node_id]
+            logger.info(f"Node removed: {node_id}")
             
-            # Reduce delay if response was fast and we're above minimum
-            if processing_time < politeness['base_delay'] * 0.5 and politeness['base_delay'] > self.min_delay:
-                politeness['base_delay'] = max(politeness['base_delay'] * 0.9, self.min_delay)
-        
-        # Update domain delay
-        self.domain_delays[domain] = politeness['base_delay']
+            # Update hash ring if we're the leader
+            if self.state == NodeState.LEADER:
+                self._rebalance_urls()
     
-    def _should_crawl_url(self, url: str, depth: int) -> bool:
-        """Decide whether to crawl a URL based on predictive analysis"""
-        pattern = self._get_url_pattern(url)
-        domain = self._get_domain(url)
-        
-        # Always crawl if we have no data
-        if pattern not in self.url_counts:
-            return True
-        
-        # Check if we've already crawled this pattern recently
-        if self.url_counts.get(pattern, 0) > 10:
-            # Already crawled many times - check success rate
-            success_rate = self.url_success.get(pattern, 0) / self.url_counts[pattern]
-            if success_rate < 0.1:  # Less than 10% success rate
-                # Predict it's not valuable - skip with some probability
-                if random.random() < 0.7:  # 70% chance to skip low-value patterns
-                    self.bandwidth_saved += 1
-                    return False
-        
-        # Check depth limit
-        max_depth = self.settings.getint('DEPTH_LIMIT', 0)
-        if max_depth and depth > max_depth:
-            return False
-        
-        # Check bandwidth optimization
-        if self.total_requests > 100:  # Only after we have some data
-            current_bandwidth_reduction = self.bandwidth_saved / self.total_requests
-            if current_bandwidth_reduction < self.bandwidth_reduction_target:
-                # Need to save more bandwidth - be more selective
-                priority = self._calculate_url_priority(url, depth)
-                if priority < 0.3:  # Low priority URLs
-                    if random.random() < 0.5:  # 50% chance to skip
-                        self.bandwidth_saved += 1
-                        return False
-        
-        return True
+    def _start_gossip(self):
+        """Start gossip protocol for node discovery"""
+        try:
+            self.gossip_transport = reactor.listenUDP(self.port, self.gossip_protocol)
+            logger.info(f"Gossip protocol started on port {self.port}")
+        except Exception as e:
+            logger.error(f"Failed to start gossip protocol: {e}")
     
-    def update_from_response(self, request: Request, response: Response, 
-                           items: list, processing_time: float):
-        """Update predictive models based on response"""
-        self.total_requests += 1
-        self.request_counter += 1
+    def _become_leader(self):
+        """Transition to leader state"""
+        self.state = NodeState.LEADER
+        self.leader_id = self.node_id
+        logger.info(f"Node {self.node_id} became leader for term {self.current_term}")
         
-        if response.status == 200:
-            self.successful_requests += 1
-            self.data_yield += len(items)
+        # Initialize URL assignments
+        self._rebalance_urls()
         
-        # Calculate reward
-        reward = self._calculate_reward(request, response, items, processing_time)
-        
-        # Update bandit
-        self._update_bandit(request.url, reward)
-        
-        # Update politeness
-        domain = self._get_domain(request.url)
-        self._update_politeness(domain, response, processing_time)
-        
-        # Update LSTM model periodically
-        if self.lstm_training_enabled and self.request_counter % self.lstm_update_frequency == 0:
-            self._update_lstm_model()
-        
-        # Log statistics periodically
-        if self.request_counter % 100 == 0:
-            self._log_statistics()
+        # Start sending heartbeats
+        self._send_heartbeats()
     
-    def _update_lstm_model(self):
-        """Update LSTM model with recent patterns (simplified implementation)"""
-        # In a real implementation, this would train an LSTM model on URL sequences
-        # For now, we just update pattern embeddings
-        for domain, patterns in self.site_patterns.items():
-            for i, pattern in enumerate(patterns[-self.sequence_length:]):
-                if pattern not in self.pattern_embeddings:
-                    # Create simple embedding based on pattern features
-                    embedding = np.random.randn(10) * 0.1
-                    self.pattern_embeddings[pattern] = embedding
-    
-    def _log_statistics(self):
-        """Log predictive crawling statistics"""
-        if self.total_requests == 0:
+    def _send_heartbeats(self):
+        """Send heartbeats to all followers"""
+        if self.state != NodeState.LEADER:
             return
         
-        success_rate = self.successful_requests / self.total_requests * 100
-        bandwidth_saved_pct = self.bandwidth_saved / self.total_requests * 100
-        
-        logger.info(
-            f"Predictive Crawling Stats: "
-            f"Requests={self.total_requests}, "
-            f"Success={success_rate:.1f}%, "
-            f"Bandwidth Saved={bandwidth_saved_pct:.1f}%, "
-            f"Data Yield={self.data_yield} items"
-        )
-    
-    def get_stats(self) -> dict:
-        """Get current statistics"""
-        return {
-            'total_requests': self.total_requests,
-            'successful_requests': self.successful_requests,
-            'bandwidth_saved': self.bandwidth_saved,
-            'data_yield': self.data_yield,
-            'success_rate': self.successful_requests / max(1, self.total_requests),
-            'bandwidth_saved_pct': self.bandwidth_saved / max(1, self.total_requests),
-            'unique_patterns': len(self.url_counts),
-            'domains_tracked': len(self.domain_politeness)
+        heartbeat = {
+            'type': 'heartbeat',
+            'node_id': self.node_id,
+            'term': self.current_term,
+            'timestamp': time.time()
         }
+        
+        for node_id, node in self.nodes.items():
+            if node_id != self.node_id:
+                data = pickle.dumps(heartbeat)
+                self.gossip_transport.write(data, (node.host, node.port))
+        
+        # Schedule next heartbeat
+        reactor.callLater(1.0, self._send_heartbeats)
+    
+    def _rebalance_urls(self):
+        """Rebalance URL assignments across nodes"""
+        if self.state != NodeState.LEADER:
+            return
+        
+        # Simple round-robin assignment for now
+        # In production, this would consider node load and capabilities
+        node_ids = list(self.nodes.keys())
+        self.url_assignments = {node_id: [] for node_id in node_ids}
+        
+        # Notify all nodes of new assignments
+        self._broadcast_url_assignments()
+    
+    def _broadcast_url_assignments(self):
+        """Broadcast URL assignments to all nodes"""
+        message = {
+            'type': 'url_assignment',
+            'node_id': self.node_id,
+            'term': self.current_term,
+            'assignments': self.url_assignments
+        }
+        
+        for node_id, node in self.nodes.items():
+            if node_id != self.node_id:
+                data = pickle.dumps(message)
+                self.gossip_transport.write(data, (node.host, node.port))
+    
+    def is_url_for_this_node(self, url: str) -> bool:
+        """Check if a URL should be processed by this node"""
+        if not self.hash_ring:
+            # No sharding yet, process locally
+            return True
+        
+        assigned_node = self.hash_ring.get_node(url)
+        return assigned_node == self.node_id
+    
+    def get_node_for_url(self, url: str) -> Optional[NodeInfo]:
+        """Get the node responsible for a URL"""
+        if not self.hash_ring:
+            return self.nodes.get(self.node_id)
+        
+        node_id = self.hash_ring.get_node(url)
+        return self.nodes.get(node_id) if node_id else None
+    
+    def is_duplicate_request(self, url: str) -> bool:
+        """Check if request has been seen before (deduplication)"""
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        
+        # Check local cache
+        if url_hash in self.seen_requests:
+            return True
+        
+        # Add to seen requests
+        self.seen_requests.add(url_hash)
+        
+        # TODO: In production, this should be distributed
+        # using a gossip-based bloom filter or consistent hashing
+        
+        return False
+    
+    def forward_request(self, request: Request, node: NodeInfo) -> Deferred:
+        """Forward a request to another node"""
+        # This would send the request to the appropriate node
+        # For now, we'll just log it
+        logger.info(f"Forwarding request {request.url} to node {node.node_id}")
+        
+        # In production, this would serialize and send the request
+        # to the target node via TCP
+        
+        deferred = Deferred()
+        deferred.callback(None)  # Placeholder
+        return deferred
+    
+    def _start_cleanup(self):
+        """Start periodic cleanup of old data"""
+        self._cleanup_seen_requests()
+        reactor.callLater(300, self._start_cleanup)  # Every 5 minutes
+    
+    def _cleanup_seen_requests(self):
+        """Clean up old seen requests"""
+        # In production, this would be more sophisticated
+        # For now, we'll just clear the cache if it gets too large
+        if len(self.seen_requests) > 100000:
+            self.seen_requests.clear()
+            logger.info("Cleared seen requests cache")
+    
+    def stop(self):
+        """Stop the distributed orchestrator"""
+        if self.gossip_transport:
+            self.gossip_transport.stopListening()
 
+
+# ==================== ORIGINAL SCRAPER CODE ====================
 
 class Slot:
     """Scraper slot (one per running spider)"""
@@ -496,11 +592,21 @@ class Scraper:
         assert crawler.logformatter
         self.logformatter: LogFormatter = crawler.logformatter
         
-        # Initialize predictive crawling engine
-        self.predictive_engine: PredictiveCrawlingEngine | None = None
-        if crawler.settings.getbool('PREDICTIVE_CRAWLING_ENABLED', False):
-            self.predictive_engine = PredictiveCrawlingEngine(crawler)
-            logger.info("Predictive Crawling Engine initialized")
+        # Distributed crawling support
+        self.distributed_enabled: bool = crawler.settings.getbool("DISTRIBUTED_ENABLED", False)
+        self.distributed_orchestrator: Optional[DistributedOrchestrator] = None
+        
+        if self.distributed_enabled:
+            self._init_distributed()
+
+    def _init_distributed(self):
+        """Initialize distributed crawling components"""
+        try:
+            self.distributed_orchestrator = DistributedOrchestrator(self.crawler)
+            logger.info("Distributed crawling orchestrator initialized")
+        except Exception as e:
+            logger.error(f"Failed to initialize distributed orchestrator: {e}")
+            self.distributed_enabled = False
 
     def _check_deprecated_itemproc_method(self, method: str) -> None:
         itemproc_cls = type(self.itemproc)
@@ -584,10 +690,9 @@ class Scraper:
                 self.itemproc.close_spider(self.crawler.spider)
             )
         
-        # Log predictive crawling statistics on close
-        if self.predictive_engine:
-            stats = self.predictive_engine.get_stats()
-            logger.info(f"Predictive Crawling Final Stats: {stats}")
+        # Stop distributed orchestrator
+        if self.distributed_orchestrator:
+            self.distributed_orchestrator.stop()
 
     def is_idle(self) -> bool:
         """Return True if there isn't any more spiders to process"""
@@ -599,84 +704,28 @@ class Scraper:
             assert self.crawler.spider
             self.slot.closing.callback(self.crawler.spider)
 
+    def _should_process_request(self, request: Request) -> bool:
+        """Check if this node should process the request"""
+        if not self.distributed_enabled or not self.distributed_orchestrator:
+            return True
+        
+        # Check for duplicate requests
+        if self.distributed_orchestrator.is_duplicate_request(request.url):
+            logger.debug(f"Skipping duplicate request: {request.url}")
+            return False
+        
+        # Check if URL is assigned to this node
+        if not self.distributed_orchestrator.is_url_for_this_node(request.url):
+            target_node = self.distributed_orchestrator.get_node_for_url(request.url)
+            if target_node:
+                logger.debug(f"Forwarding request {request.url} to node {target_node.node_id}")
+                # Forward request to appropriate node
+                self.distributed_orchestrator.forward_request(request, target_node)
+            return False
+        
+        return True
+
     @inlineCallbacks
     @_warn_spider_arg
     def enqueue_scrape(
         self,
-        result: Response | Failure,
-        request: Request,
-        spider: Spider | None = None,
-    ):
-        """Enqueue a response for scraping with predictive prioritization"""
-        if self.predictive_engine:
-            # Use predictive engine to decide whether to process this URL
-            depth = request.meta.get('depth', 0)
-            if not self.predictive_engine._should_crawl_url(request.url, depth):
-                logger.debug(f"Predictive engine skipping URL: {request.url}")
-                # Return empty deferred to skip processing
-                defer.returnValue(None)
-        
-        # Original enqueue logic
-        assert self.slot is not None  # typing
-        if self.slot.closing:
-            defer.returnValue(None)
-
-        # Original processing continues...
-        slot = self.slot
-        dfd = slot.add_response_request(result, request)
-
-        # Start processing if we have capacity
-        if not slot.needs_backout():
-            self._scrape()
-
-        yield dfd
-
-    def _scrape(self) -> None:
-        """Scrape next response from slot"""
-        assert self.slot is not None  # typing
-        slot = self.slot
-        
-        while slot.queue and not slot.needs_backout():
-            result, request, deferred = slot.next_response_request_deferred()
-            
-            # Process the response
-            start_time = datetime.now()
-            processing_dfd = self._scrape_response(result, request, deferred)
-            
-            # Track processing time for predictive engine
-            if self.predictive_engine and isinstance(result, Response):
-                processing_dfd.addCallback(
-                    lambda items, req=request, resp=result, start=start_time: 
-                    self._update_predictive_engine(req, resp, items, start)
-                )
-            
-            processing_dfd.addBoth(self._finish_scrape, request)
-    
-    def _update_predictive_engine(self, request: Request, response: Response, 
-                                 items: list, start_time: datetime) -> list:
-        """Update predictive engine with response data"""
-        if self.predictive_engine:
-            processing_time = (datetime.now() - start_time).total_seconds()
-            self.predictive_engine.update_from_response(
-                request, response, items, processing_time
-            )
-        return items
-
-    def _scrape_response(self, result: Response | Failure, request: Request, 
-                        deferred: Deferred[None]) -> Deferred:
-        """Scrape a single response"""
-        # Original response processing logic
-        # ... (rest of the original _scrape_response method)
-        pass
-
-    def _finish_scrape(self, result: Any, request: Request) -> Any:
-        """Finish scraping a response"""
-        assert self.slot is not None  # typing
-        self.slot.finish_response(result if isinstance(result, (Response, Failure)) else None, request)
-        self._check_if_closing()
-        
-        # Continue processing if we have capacity
-        if not self.slot.needs_backout() and self.slot.queue:
-            self._scrape()
-        
-        return result

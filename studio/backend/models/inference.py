@@ -318,6 +318,24 @@ class ChatCompletionRequest(BaseModel):
         None,
         description = "[x-vex] List of enabled tool names (e.g. ['web_search', 'python', 'terminal']). If None, all tools are enabled.",
     )
+    auto_heal_tool_calls: Optional[bool] = Field(
+        True,
+        description = "[x-vex] Auto-detect and fix malformed tool calls from model output.",
+    )
+    max_tool_calls_per_message: Optional[int] = Field(
+        10,
+        ge = 0,
+        description = "[x-vex] Maximum number of tool call iterations per message (0 = disabled, 9999 = unlimited).",
+    )
+    tool_call_timeout: Optional[int] = Field(
+        300,
+        ge = 1,
+        description = "[x-vex] Timeout in seconds for each tool call execution (9999 = no limit).",
+    )
+    session_id: Optional[str] = Field(
+        None,
+        description = "[x-vex] Session/thread ID for scoping tool execution sandbox.",
+    )
 
 
 # ── Streaming response chunks ────────────────────────────────────

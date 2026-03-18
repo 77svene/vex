@@ -97,185 +97,6 @@ class _Slot:
             self.closing.callback(None)
 
 
-class RaftNode:
-    """Raft consensus node for distributed coordination."""
-    
-    def __init__(self, node_id: str, peers: list[str], engine: ExecutionEngine):
-        self.node_id = node_id
-        self.peers = peers
-        self.engine = engine
-        self.state = "follower"  # follower, candidate, leader
-        self.current_term = 0
-        self.voted_for = None
-        self.log = []  # List of (term, request) tuples
-        self.commit_index = -1
-        self.last_applied = -1
-        self.next_index = {}  # For leader: next log index to send to each peer
-        self.match_index = {}  # For leader: highest log index known to be replicated
-        self.election_timeout = 5.0  # seconds
-        self.heartbeat_interval = 1.0  # seconds
-        self.last_heartbeat = time()
-        self.leader_id = None
-        self.votes_received = set()
-        self._running = False
-        self._election_task = None
-        self._heartbeat_task = None
-        
-    async def start(self):
-        """Start the Raft node."""
-        self._running = True
-        if is_asyncio_available():
-            self._election_task = asyncio.ensure_future(self._election_timer())
-            self._heartbeat_task = asyncio.ensure_future(self._heartbeat_timer())
-        else:
-            # Fallback to twisted for non-asyncio environments
-            from twisted.internet import reactor
-            self._election_task = reactor.callLater(self.election_timeout, self._check_election)
-            self._heartbeat_task = reactor.callLater(self.heartbeat_interval, self._send_heartbeats)
-    
-    async def stop(self):
-        """Stop the Raft node."""
-        self._running = False
-        if self._election_task:
-            if is_asyncio_available():
-                self._election_task.cancel()
-            else:
-                self._election_task.cancel()
-        if self._heartbeat_task:
-            if is_asyncio_available():
-                self._heartbeat_task.cancel()
-            else:
-                self._heartbeat_task.cancel()
-    
-    async def _election_timer(self):
-        """Timer for triggering elections."""
-        while self._running:
-            await asyncio.sleep(self.election_timeout)
-            if self.state != "leader" and time() - self.last_heartbeat > self.election_timeout:
-                await self.start_election()
-    
-    async def _heartbeat_timer(self):
-        """Timer for sending heartbeats (leader only)."""
-        while self._running:
-            await asyncio.sleep(self.heartbeat_interval)
-            if self.state == "leader":
-                await self.send_heartbeats()
-    
-    def _check_election(self):
-        """Twisted version of election timer."""
-        if self._running and self.state != "leader" and time() - self.last_heartbeat > self.election_timeout:
-            deferred_from_coro(self.start_election())
-        if self._running:
-            from twisted.internet import reactor
-            self._election_task = reactor.callLater(self.election_timeout, self._check_election)
-    
-    def _send_heartbeats(self):
-        """Twisted version of heartbeat timer."""
-        if self._running and self.state == "leader":
-            deferred_from_coro(self.send_heartbeats())
-        if self._running:
-            from twisted.internet import reactor
-            self._heartbeat_task = reactor.callLater(self.heartbeat_interval, self._send_heartbeats)
-    
-    async def start_election(self):
-        """Start a new election."""
-        self.state = "candidate"
-        self.current_term += 1
-        self.voted_for = self.node_id
-        self.votes_received = {self.node_id}
-        self.last_heartbeat = time()
-        
-        # Request votes from all peers
-        for peer in self.peers:
-            if peer != self.node_id:
-                await self.request_vote(peer)
-        
-        # Check if we won
-        if len(self.votes_received) > len(self.peers) // 2:
-            await self.become_leader()
-    
-    async def request_vote(self, peer: str):
-        """Request vote from a peer (simplified - in real implementation would use RPC)."""
-        # In a real implementation, this would send an RPC to the peer
-        # For now, we'll simulate with a simple log message
-        logger.debug(f"Node {self.node_id} requesting vote from {peer} for term {self.current_term}")
-        # Simulate receiving vote (in real implementation, this would be async RPC)
-        self.votes_received.add(peer)
-    
-    async def become_leader(self):
-        """Transition to leader state."""
-        self.state = "leader"
-        self.leader_id = self.node_id
-        logger.info(f"Node {self.node_id} became leader for term {self.current_term}")
-        
-        # Initialize leader state
-        for peer in self.peers:
-            if peer != self.node_id:
-                self.next_index[peer] = len(self.log)
-                self.match_index[peer] = -1
-        
-        # Send initial heartbeats
-        await self.send_heartbeats()
-    
-    async def send_heartbeats(self):
-        """Send heartbeats to all peers."""
-        for peer in self.peers:
-            if peer != self.node_id:
-                await self.append_entries(peer)
-    
-    async def append_entries(self, peer: str):
-        """Send append entries RPC to a peer (simplified)."""
-        # In a real implementation, this would send log entries to followers
-        logger.debug(f"Leader {self.node_id} sending heartbeat to {peer}")
-        # Simulate successful replication
-        if peer in self.match_index:
-            self.match_index[peer] = len(self.log) - 1
-    
-    async def append_request(self, request: Request):
-        """Append a request to the log (leader only)."""
-        if self.state != "leader":
-            raise RuntimeError("Only leader can append requests")
-        
-        self.log.append((self.current_term, request))
-        logger.debug(f"Leader {self.node_id} appended request to log, index {len(self.log) - 1}")
-        
-        # Replicate to followers
-        for peer in self.peers:
-            if peer != self.node_id:
-                await self.append_entries(peer)
-        
-        # Update commit index (simplified - in real implementation would track replication)
-        self.commit_index = len(self.log) - 1
-        await self.apply_committed_entries()
-    
-    async def apply_committed_entries(self):
-        """Apply committed log entries to the state machine."""
-        while self.last_applied < self.commit_index:
-            self.last_applied += 1
-            term, request = self.log[self.last_applied]
-            # Apply to engine (schedule the request)
-            if hasattr(self.engine, 'schedule_request_from_raft'):
-                await self.engine.schedule_request_from_raft(request)
-    
-    def receive_append_entries(self, term: int, leader_id: str, entries: list):
-        """Receive append entries from leader (follower only)."""
-        self.last_heartbeat = time()
-        if term > self.current_term:
-            self.current_term = term
-            self.state = "follower"
-            self.voted_for = None
-        
-        self.leader_id = leader_id
-        
-        # Append new entries (simplified)
-        for entry in entries:
-            self.log.append(entry)
-        
-        # Update commit index and apply
-        self.commit_index = len(self.log) - 1
-        deferred_from_coro(self.apply_committed_entries())
-
-
 class ExecutionEngine:
     _SLOT_HEARTBEAT_INTERVAL: float = 5.0
 
@@ -306,16 +127,6 @@ class ExecutionEngine:
         self._start_request_processing_awaitable: (
             asyncio.Future[None] | Deferred[None] | None
         ) = None
-        
-        # Distributed crawling configuration
-        self.distributed_enabled = self.settings.getbool('DISTRIBUTED_ENABLED', False)
-        self.raft_node = None
-        if self.distributed_enabled:
-            node_id = self.settings.get('DISTRIBUTED_NODE_ID', 'node1')
-            peers = self.settings.getlist('DISTRIBUTED_PEERS', [])
-            if peers:
-                self.raft_node = RaftNode(node_id, peers, self)
-        
         downloader_cls: type[Downloader] = load_object(self.settings["DOWNLOADER"])
         try:
             self.scheduler_cls: type[BaseScheduler] = self._get_scheduler_class(
@@ -369,12 +180,6 @@ class ExecutionEngine:
             raise RuntimeError("Engine already running")
         self.start_time = time()
         self._starting = True
-        
-        # Start Raft node if distributed mode is enabled
-        if self.raft_node:
-            await self.raft_node.start()
-            logger.info(f"Distributed crawling enabled with Raft consensus, node ID: {self.raft_node.node_id}")
-        
         await self.signals.send_catch_log_async(signal=signals.engine_started)
         if self._stopping:
             # band-aid until https://github.com/vex/vex/issues/6916
@@ -413,92 +218,459 @@ class ExecutionEngine:
 
         self.running = self._starting = False
         self._stopping = True
-        
-        # Stop Raft node if distributed mode is enabled
-        if self.raft_node:
-            await self.raft_node.stop()
-        
         if self._start_request_processing_awaitable is not None:
             if (
                 not is_asyncio_available()
-                and isinstance(self._start_request_processing_awaitable, Deferred)
+                or self._start_request_processing_awaitable
+                is not asyncio.current_task()
             ):
+                # If using the asyncio loop and stop_async() was called from
+                # start() itself, we can't cancel it, and _start_request_processing()
+                # will exit via the self.running check.
                 self._start_request_processing_awaitable.cancel()
-            elif isinstance(self._start_request_processing_awaitable, asyncio.Future):
-                self._start_request_processing_awaitable.cancel()
-
-        if self._slot is not None and self._slot.closing is None:
-            await self._slot.close()
-
+            self._start_request_processing_awaitable = None
+        if self.spider is not None:
+            await self.close_spider_async(reason="shutdown")
         await self.signals.send_catch_log_async(signal=signals.engine_stopped)
-        self._stopping = False
-        if self._closewait is not None:
+        if self._closewait:
             self._closewait.callback(None)
 
-    async def schedule_request_from_raft(self, request: Request) -> None:
-        """Schedule a request received from Raft consensus (for distributed mode)."""
-        if self._slot is None:
-            return
-        
-        # Add to scheduler and process
-        self._slot.add_request(request)
-        await self._download(request)
+    def close(self) -> Deferred[None]:  # pragma: no cover
+        warnings.warn(
+            "ExecutionEngine.close() is deprecated, use close_async() instead",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return deferred_from_coro(self.close_async())
+
+    async def close_async(self) -> None:
+        """
+        Gracefully close the execution engine.
+        If it has already been started, stop it. In all cases, close the spider and the downloader.
+        """
+        if self.running:
+            await self.stop_async()  # will also close spider and downloader
+        elif self.spider is not None:
+            await self.close_spider_async(
+                reason="shutdown"
+            )  # will also close downloader
+        elif hasattr(self, "downloader"):
+            self.downloader.close()
+
+    def pause(self) -> None:
+        self.paused = True
+
+    def unpause(self) -> None:
+        self.paused = False
+
+    async def _process_start_next(self) -> None:
+        """Processes the next item or request from Spider.start().
+
+        If a request, it is scheduled. If an item, it is sent to item
+        pipelines.
+        """
+        assert self._start is not None
+        try:
+            item_or_request = await self._start.__anext__()
+        except StopAsyncIteration:
+            self._start = None
+        except Exception as exception:
+            self._start = None
+            exception_traceback = format_exc()
+            logger.error(
+                f"Error while reading start items and requests: {exception}.\n{exception_traceback}",
+                exc_info=True,
+            )
+        else:
+            if not self.spider:
+                return  # spider already closed
+            if isinstance(item_or_request, Request):
+                self.crawl(item_or_request)
+            else:
+                assert self._slot is not None
+                _schedule_coro(
+                    self.scraper.start_itemproc_async(item_or_request, response=None)
+                )
+                self._slot.nextcall.schedule()
 
     async def _start_request_processing(self) -> None:
-        """Start processing requests from the scheduler."""
-        if self._slot is None:
-            return
-        
-        while self.running:
-            if self.paused:
-                await asyncio.sleep(0.1)
-                continue
-            
-            try:
-                # Get next request from scheduler
-                request = await self._slot.scheduler.next_request()
-                if request is None:
-                    # No more requests, wait a bit
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                # In distributed mode with Raft, only leader schedules requests
-                if self.raft_node and self.raft_node.state != "leader":
-                    # Follower nodes don't schedule, they wait for requests from leader
-                    await asyncio.sleep(0.1)
-                    continue
-                
-                # Add request to in-progress set
-                self._slot.add_request(request)
-                
-                # If distributed mode and we're leader, replicate request via Raft
-                if self.raft_node and self.raft_node.state == "leader":
-                    await self.raft_node.append_request(request)
-                else:
-                    # Non-distributed mode or follower: process normally
-                    await self._download(request)
-                    
-            except Exception as e:
-                logger.error(f"Error in request processing: {e}")
-                await asyncio.sleep(0.1)
-
-    async def _download(self, request: Request) -> None:
-        """Download a request and process the response."""
+        """Starts consuming Spider.start() output and sending scheduled
+        requests."""
+        # Starts the processing of scheduled requests, as well as a periodic
+        # call to that processing method for scenarios where the scheduler
+        # reports having pending requests but returns none.
         try:
-            # Download the request
-            response = await self.downloader.fetch(request, self.spider)
-            
-            # Process the response
-            await self.scraper.enqueue_scrape(response, request)
-            
-            # Remove from in-progress
-            self._slot.remove_request(request)
-            
-        except Exception as e:
-            logger.error(f"Error downloading {request}: {e}")
+            assert self._slot is not None  # typing
+            self._slot.nextcall.schedule()
+            self._slot.heartbeat.start(self._SLOT_HEARTBEAT_INTERVAL)
+
+            while self._start and self.spider and self.running:
+                await self._process_start_next()
+                if not self.needs_backout():
+                    # Give room for the outcome of self._process_start_next() to be
+                    # processed before continuing with the next iteration.
+                    self._slot.nextcall.schedule()
+                    await self._slot.nextcall.wait()
+        except (asyncio.exceptions.CancelledError, CancelledError):
+            # self.stop_async() has cancelled us, nothing to do
+            return
+        except Exception:
+            # an error happened, log it and stop the engine
+            self._start_request_processing_awaitable = None
+            logger.error(
+                "Error while processing requests from start()",
+                exc_info=True,
+                extra={"spider": self.spider},
+            )
+            await self.stop_async()
+
+    def _start_scheduled_requests(self) -> None:
+        if self._slot is None or self._slot.closing is not None or self.paused:
+            return
+
+        while not self.needs_backout():
+            if not self._start_scheduled_request():
+                break
+
+        if self.spider_is_idle() and self._slot.close_if_idle:
+            self._spider_idle()
+
+    def needs_backout(self) -> bool:
+        """Returns ``True`` if no more requests can be sent at the moment, or
+        ``False`` otherwise.
+
+        See :ref:`start-requests-lazy` for an example.
+        """
+        assert self.scraper.slot is not None  # typing
+        return (
+            not self.running
+            or not self._slot
+            or bool(self._slot.closing)
+            or self.downloader.needs_backout()
+            or self.scraper.slot.needs_backout()
+        )
+
+    def _start_scheduled_request(self) -> bool:
+        assert self._slot is not None  # typing
+        assert self.spider is not None  # typing
+
+        request = self._slot.scheduler.next_request()
+        if request is None:
+            self.signals.send_catch_log(signals.scheduler_empty)
+            return False
+
+        d: Deferred[Response | Request] = self._download(request)
+        d.addBoth(self._handle_downloader_output, request)
+        d.addErrback(
+            lambda f: logger.info(
+                "Error while handling downloader output",
+                exc_info=failure_to_exc_info(f),
+                extra={"spider": self.spider},
+            )
+        )
+
+        def _remove_request(_: Any) -> None:
+            assert self._slot
             self._slot.remove_request(request)
 
-    # ... rest of the existing methods would be preserved here ...
-    # Note: In a real implementation, we would need to modify the existing
-    # _next_request method and other methods to integrate with Raft consensus.
-    # This is a simplified implementation showing the core integration points.
+        d2: Deferred[None] = d.addBoth(_remove_request)
+        d2.addErrback(
+            lambda f: logger.info(
+                "Error while removing request from slot",
+                exc_info=failure_to_exc_info(f),
+                extra={"spider": self.spider},
+            )
+        )
+        slot = self._slot
+        d2.addBoth(lambda _: slot.nextcall.schedule())
+        d2.addErrback(
+            lambda f: logger.info(
+                "Error while scheduling new request",
+                exc_info=failure_to_exc_info(f),
+                extra={"spider": self.spider},
+            )
+        )
+        return True
+
+    @inlineCallbacks
+    def _handle_downloader_output(
+        self, result: Request | Response | Failure, request: Request
+    ) -> Generator[Deferred[Any], Any, None]:
+        if not isinstance(result, (Request, Response, Failure)):
+            raise TypeError(
+                f"Incorrect type: expected Request, Response or Failure, got {type(result)}: {result!r}"
+            )
+
+        # downloader middleware can return requests (for example, redirects)
+        if isinstance(result, Request):
+            self.crawl(result)
+            return
+
+        try:
+            yield self.scraper.enqueue_scrape(result, request)
+        except Exception:
+            assert self.spider is not None
+            logger.error(
+                "Error while enqueuing scrape",
+                exc_info=True,
+                extra={"spider": self.spider},
+            )
+
+    def spider_is_idle(self) -> bool:
+        if self._slot is None:
+            raise RuntimeError("Engine slot not assigned")
+        if not self.scraper.slot.is_idle():  # type: ignore[union-attr]
+            return False
+        if self.downloader.active:  # downloader has pending requests
+            return False
+        if self._start is not None:  # not all start requests are handled
+            return False
+        return not self._slot.scheduler.has_pending_requests()
+
+    def crawl(self, request: Request) -> None:
+        """Inject the request into the spider <-> downloader pipeline"""
+        if self.spider is None:
+            raise RuntimeError(f"No open spider to crawl: {request}")
+        self._schedule_request(request)
+        self._slot.nextcall.schedule()  # type: ignore[union-attr]
+
+    def _schedule_request(self, request: Request) -> None:
+        request_scheduled_result = self.signals.send_catch_log(
+            signals.request_scheduled,
+            request=request,
+            spider=self.spider,
+            dont_log=IgnoreRequest,
+        )
+        for _, result in request_scheduled_result:
+            if isinstance(result, Failure) and isinstance(result.value, IgnoreRequest):
+                return
+        if not self._slot.scheduler.enqueue_request(request):  # type: ignore[union-attr]
+            self.signals.send_catch_log(
+                signals.request_dropped, request=request, spider=self.spider
+            )
+
+    def download(self, request: Request) -> Deferred[Response]:
+        """Return a Deferred which fires with a Response as result, only downloader middlewares are applied"""
+        warnings.warn(
+            "ExecutionEngine.download() is deprecated, use download_async() instead",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return deferred_from_coro(self.download_async(request))
+
+    async def download_async(self, request: Request) -> Response:
+        """Return a coroutine which fires with a Response as result.
+
+         Only downloader middlewares are applied.
+
+        .. versionadded:: 2.14
+        """
+        if self.spider is None:
+            raise RuntimeError(f"No open spider to crawl: {request}")
+        try:
+            response_or_request = await maybe_deferred_to_future(
+                self._download(request)
+            )
+        finally:
+            assert self._slot is not None
+            self._slot.remove_request(request)
+        if isinstance(response_or_request, Request):
+            return await self.download_async(response_or_request)
+        return response_or_request
+
+    @inlineCallbacks
+    def _download(
+        self, request: Request
+    ) -> Generator[Deferred[Any], Any, Response | Request]:
+        assert self._slot is not None  # typing
+        assert self.spider is not None
+
+        self._slot.add_request(request)
+        try:
+            result: Response | Request
+            if self._downloader_fetch_needs_spider:
+                result = yield self.downloader.fetch(request, self.spider)
+            else:
+                result = yield self.downloader.fetch(request)
+            if not isinstance(result, (Response, Request)):
+                raise TypeError(
+                    f"Incorrect type: expected Response or Request, got {type(result)}: {result!r}"
+                )
+            if isinstance(result, Response):
+                if result.request is None:
+                    result.request = request
+                logkws = self.logformatter.crawled(result.request, result, self.spider)
+                if logkws is not None:
+                    logger.log(
+                        *logformatter_adapter(logkws), extra={"spider": self.spider}
+                    )
+                self.signals.send_catch_log(
+                    signal=signals.response_received,
+                    response=result,
+                    request=result.request,
+                    spider=self.spider,
+                )
+            return result
+        finally:
+            self._slot.nextcall.schedule()
+
+    def open_spider(
+        self, spider: Spider, close_if_idle: bool = True
+    ) -> Deferred[None]:  # pragma: no cover
+        warnings.warn(
+            "ExecutionEngine.open_spider() is deprecated, use open_spider_async() instead",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return deferred_from_coro(self.open_spider_async(close_if_idle=close_if_idle))
+
+    async def open_spider_async(self, *, close_if_idle: bool = True) -> None:
+        assert self.crawler.spider
+        if self._slot is not None:
+            raise RuntimeError(
+                f"No free spider slot when opening {self.crawler.spider.name!r}"
+            )
+        logger.info("Spider opened", extra={"spider": self.crawler.spider})
+        self.spider = self.crawler.spider
+        nextcall = CallLaterOnce(self._start_scheduled_requests)
+        scheduler = build_from_crawler(self.scheduler_cls, self.crawler)
+        self._slot = _Slot(close_if_idle, nextcall, scheduler)
+        self._start = await self.scraper.spidermw.process_start()
+        if hasattr(scheduler, "open") and (d := scheduler.open(self.crawler.spider)):
+            await maybe_deferred_to_future(d)
+        await self.scraper.open_spider_async()
+        assert self.crawler.stats
+        if argument_is_required(self.crawler.stats.open_spider, "spider"):
+            warnings.warn(
+                f"The open_spider() method of {global_object_name(type(self.crawler.stats))} requires a spider argument,"
+                f" this is deprecated and the argument will not be passed in future Scrapy versions.",
+                ScrapyDeprecationWarning,
+                stacklevel=2,
+            )
+            self.crawler.stats.open_spider(spider=self.crawler.spider)
+        else:
+            self.crawler.stats.open_spider()
+        await self.signals.send_catch_log_async(
+            signals.spider_opened, spider=self.crawler.spider
+        )
+
+    def _spider_idle(self) -> None:
+        """
+        Called when a spider gets idle, i.e. when there are no remaining requests to download or schedule.
+        It can be called multiple times. If a handler for the spider_idle signal raises a DontCloseSpider
+        exception, the spider is not closed until the next loop and this function is guaranteed to be called
+        (at least) once again. A handler can raise CloseSpider to provide a custom closing reason.
+        """
+        assert self.spider is not None  # typing
+        expected_ex = (DontCloseSpider, CloseSpider)
+        res = self.signals.send_catch_log(
+            signals.spider_idle, spider=self.spider, dont_log=expected_ex
+        )
+        detected_ex = {
+            ex: x.value
+            for _, x in res
+            for ex in expected_ex
+            if isinstance(x, Failure) and isinstance(x.value, ex)
+        }
+        if DontCloseSpider in detected_ex:
+            return
+        if self.spider_is_idle():
+            ex = detected_ex.get(CloseSpider, CloseSpider(reason="finished"))
+            assert isinstance(ex, CloseSpider)  # typing
+            _schedule_coro(self.close_spider_async(reason=ex.reason))
+
+    def close_spider(
+        self, spider: Spider, reason: str = "cancelled"
+    ) -> Deferred[None]:  # pragma: no cover
+        warnings.warn(
+            "ExecutionEngine.close_spider() is deprecated, use close_spider_async() instead",
+            ScrapyDeprecationWarning,
+            stacklevel=2,
+        )
+        return deferred_from_coro(self.close_spider_async(reason=reason))
+
+    async def close_spider_async(self, *, reason: str = "cancelled") -> None:  # noqa: PLR0912
+        """Close (cancel) spider and clear all its outstanding requests.
+
+        .. versionadded:: 2.14
+        """
+        if self.spider is None:
+            raise RuntimeError("Spider not opened")
+
+        if self._slot is None:
+            raise RuntimeError("Engine slot not assigned")
+
+        if self._slot.closing is not None:
+            await maybe_deferred_to_future(self._slot.closing)
+            return
+
+        spider = self.spider
+
+        logger.info(
+            "Closing spider (%(reason)s)", {"reason": reason}, extra={"spider": spider}
+        )
+
+        def log_failure(msg: str) -> None:
+            logger.error(msg, exc_info=True, extra={"spider": spider})  # noqa: LOG014
+
+        try:
+            await self._slot.close()
+        except Exception:
+            log_failure("Slot close failure")
+
+        try:
+            self.downloader.close()
+        except Exception:
+            log_failure("Downloader close failure")
+
+        try:
+            await self.scraper.close_spider_async()
+        except Exception:
+            log_failure("Scraper close failure")
+
+        if hasattr(self._slot.scheduler, "close"):
+            try:
+                if (d := self._slot.scheduler.close(reason)) is not None:
+                    await maybe_deferred_to_future(d)
+            except Exception:
+                log_failure("Scheduler close failure")
+
+        try:
+            await self.signals.send_catch_log_async(
+                signal=signals.spider_closed,
+                spider=spider,
+                reason=reason,
+            )
+        except Exception:
+            log_failure("Error while sending spider_close signal")
+
+        assert self.crawler.stats
+        try:
+            if argument_is_required(self.crawler.stats.close_spider, "spider"):
+                warnings.warn(
+                    f"The close_spider() method of {global_object_name(type(self.crawler.stats))} requires a spider argument,"
+                    f" this is deprecated and the argument will not be passed in future Scrapy versions.",
+                    ScrapyDeprecationWarning,
+                    stacklevel=2,
+                )
+                self.crawler.stats.close_spider(
+                    spider=self.crawler.spider, reason=reason
+                )
+            else:
+                self.crawler.stats.close_spider(reason=reason)
+        except Exception:
+            log_failure("Stats close failure")
+
+        logger.info(
+            "Spider closed (%(reason)s)",
+            {"reason": reason},
+            extra={"spider": spider},
+        )
+
+        self._slot = None
+        self.spider = None
+
+        try:
+            await ensure_awaitable(self._spider_closed_callback(spider))
+        except Exception:
+            log_failure("Error running spider_closed_callback")

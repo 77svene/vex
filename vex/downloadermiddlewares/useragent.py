@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import random
-import time
+import logging
 import hashlib
-from collections import defaultdict
-from typing import TYPE_CHECKING, Dict, List, Tuple, Optional, Any
-import numpy as np
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Tuple
+from collections import deque
+import time
 
 from vex import Request, Spider, signals
 from vex.utils.decorators import _warn_spider_arg
 from vex.utils.deprecate import warn_on_deprecated_spider_attribute
+from vex.exceptions import NotConfigured
 
 if TYPE_CHECKING:
     # typing.Self requires Python 3.11
@@ -20,651 +21,645 @@ if TYPE_CHECKING:
     from vex.crawler import Crawler
     from vex.http import Response
 
-
-class TLSFingerprintGenerator:
-    """Generates and rotates TLS fingerprints"""
-    
-    # Common TLS fingerprints from real browsers
-    TLS_FINGERPRINTS = [
-        # Chrome 120
-        {
-            "cipher_suites": [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "ECDHE-ECDSA-AES128-GCM-SHA256",
-                "ECDHE-RSA-AES128-GCM-SHA256",
-                "ECDHE-ECDSA-AES256-GCM-SHA384",
-                "ECDHE-RSA-AES256-GCM-SHA384",
-                "ECDHE-ECDSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-AES128-SHA",
-                "ECDHE-RSA-AES256-SHA",
-                "AES128-GCM-SHA256",
-                "AES256-GCM-SHA384",
-                "AES128-SHA",
-                "AES256-SHA"
-            ],
-            "tls_version": "TLSv1.3",
-            "extensions": [
-                "server_name",
-                "extended_master_secret",
-                "renegotiation_info",
-                "supported_groups",
-                "ec_point_formats",
-                "session_ticket",
-                "application_layer_protocol_negotiation",
-                "status_request",
-                "signature_algorithms",
-                "signed_certificate_timestamp",
-                "key_share",
-                "psk_key_exchange_modes",
-                "supported_versions",
-                "compress_certificate",
-                "application_settings"
-            ],
-            "supported_groups": ["x25519", "secp256r1", "secp384r1"],
-            "weight": 0.4
-        },
-        # Firefox 121
-        {
-            "cipher_suites": [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "ECDHE-ECDSA-AES128-GCM-SHA256",
-                "ECDHE-RSA-AES128-GCM-SHA256",
-                "ECDHE-ECDSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-CHACHA20-POLY1305",
-                "ECDHE-ECDSA-AES256-GCM-SHA384",
-                "ECDHE-RSA-AES256-GCM-SHA384",
-                "ECDHE-ECDSA-AES256-SHA",
-                "ECDHE-RSA-AES256-SHA",
-                "AES128-GCM-SHA256",
-                "AES256-GCM-SHA384",
-                "AES128-SHA",
-                "AES256-SHA"
-            ],
-            "tls_version": "TLSv1.3",
-            "extensions": [
-                "server_name",
-                "extended_master_secret",
-                "renegotiation_info",
-                "supported_groups",
-                "ec_point_formats",
-                "session_ticket",
-                "application_layer_protocol_negotiation",
-                "status_request",
-                "signature_algorithms",
-                "signed_certificate_timestamp",
-                "key_share",
-                "psk_key_exchange_modes",
-                "supported_versions",
-                "compress_certificate"
-            ],
-            "supported_groups": ["x25519", "secp256r1", "secp384r1", "secp521r1"],
-            "weight": 0.3
-        },
-        # Safari 17
-        {
-            "cipher_suites": [
-                "TLS_AES_128_GCM_SHA256",
-                "TLS_AES_256_GCM_SHA384",
-                "TLS_CHACHA20_POLY1305_SHA256",
-                "ECDHE-ECDSA-AES128-GCM-SHA256",
-                "ECDHE-RSA-AES128-GCM-SHA256",
-                "ECDHE-ECDSA-AES256-GCM-SHA384",
-                "ECDHE-RSA-AES256-GCM-SHA384",
-                "ECDHE-ECDSA-CHACHA20-POLY1305",
-                "ECDHE-RSA-CHACHA20-POLY1305",
-                "ECDHE-ECDSA-AES256-SHA",
-                "ECDHE-RSA-AES256-SHA",
-                "AES128-GCM-SHA256",
-                "AES256-GCM-SHA384",
-                "AES128-SHA",
-                "AES256-SHA"
-            ],
-            "tls_version": "TLSv1.3",
-            "extensions": [
-                "server_name",
-                "extended_master_secret",
-                "renegotiation_info",
-                "supported_groups",
-                "ec_point_formats",
-                "session_ticket",
-                "application_layer_protocol_negotiation",
-                "status_request",
-                "signature_algorithms",
-                "signed_certificate_timestamp",
-                "key_share",
-                "psk_key_exchange_modes",
-                "supported_versions"
-            ],
-            "supported_groups": ["x25519", "secp256r1", "secp384r1"],
-            "weight": 0.3
-        }
-    ]
-    
-    def __init__(self):
-        self.current_fingerprint_index = 0
-        self.domain_fingerprints = {}
-        self.fingerprint_performance = defaultdict(lambda: {"success": 0, "total": 0})
-    
-    def get_fingerprint(self, domain: str) -> Dict[str, Any]:
-        """Get a TLS fingerprint for a domain, rotating based on performance"""
-        if domain not in self.domain_fingerprints:
-            # Initialize with weighted random selection
-            weights = [fp["weight"] for fp in self.TLS_FINGERPRINTS]
-            self.domain_fingerprints[domain] = random.choices(
-                range(len(self.TLS_FINGERPRINTS)), 
-                weights=weights, 
-                k=1
-            )[0]
-        
-        return self.TLS_FINGERPRINTS[self.domain_fingerprints[domain]]
-    
-    def update_performance(self, domain: str, success: bool):
-        """Update performance metrics for a domain's fingerprint"""
-        fp_index = self.domain_fingerprints.get(domain, 0)
-        self.fingerprint_performance[fp_index]["total"] += 1
-        if success:
-            self.fingerprint_performance[fp_index]["success"] += 1
-        
-        # Rotate fingerprint if performance is poor
-        if (self.fingerprint_performance[fp_index]["total"] > 10 and 
-            self.fingerprint_performance[fp_index]["success"] / 
-            self.fingerprint_performance[fp_index]["total"] < 0.3):
-            self.domain_fingerprints[domain] = random.choice(
-                [i for i in range(len(self.TLS_FINGERPRINTS)) if i != fp_index]
-            )
+logger = logging.getLogger(__name__)
 
 
-class BehaviorSimulator:
-    """Simulates human-like browsing behavior"""
+class AdaptiveAntiBotMiddleware:
+    """ML-powered adaptive anti-bot evasion system with fingerprint rotation and behavior emulation"""
     
-    def __init__(self):
-        self.mouse_movement_patterns = [
-            {"speed": "slow", "jitter": 0.1, "pause_probability": 0.2},
-            {"speed": "medium", "jitter": 0.05, "pause_probability": 0.1},
-            {"speed": "fast", "jitter": 0.02, "pause_probability": 0.05}
-        ]
-        
-        self.scroll_patterns = [
-            {"speed": "slow", "direction_changes": 0.1, "pause_probability": 0.3},
-            {"speed": "medium", "direction_changes": 0.05, "pause_probability": 0.2},
-            {"speed": "fast", "direction_changes": 0.02, "pause_probability": 0.1}
-        ]
-        
-        self.typing_patterns = [
-            {"speed": "slow", "error_rate": 0.05, "pause_probability": 0.4},
-            {"speed": "medium", "error_rate": 0.02, "pause_probability": 0.2},
-            {"speed": "fast", "error_rate": 0.01, "pause_probability": 0.1}
-        ]
-    
-    def simulate_mouse_movement(self) -> Dict[str, Any]:
-        """Generate mouse movement simulation parameters"""
-        pattern = random.choice(self.mouse_movement_patterns)
-        
-        # Generate movement path
-        points = []
-        x, y = random.randint(0, 1000), random.randint(0, 800)
-        for _ in range(random.randint(5, 20)):
-            x += random.randint(-50, 50)
-            y += random.randint(-50, 50)
-            points.append((x, y))
-            
-            # Add jitter
-            if random.random() < pattern["jitter"]:
-                time.sleep(random.uniform(0.01, 0.1))
-            
-            # Add pause
-            if random.random() < pattern["pause_probability"]:
-                time.sleep(random.uniform(0.1, 0.5))
-        
-        return {
-            "points": points,
-            "speed": pattern["speed"],
-            "duration": len(points) * random.uniform(0.05, 0.2)
-        }
-    
-    def simulate_scroll(self) -> Dict[str, Any]:
-        """Generate scroll simulation parameters"""
-        pattern = random.choice(self.scroll_patterns)
-        
-        scroll_events = []
-        current_position = 0
-        target_position = random.randint(500, 3000)
-        
-        while current_position < target_position:
-            scroll_amount = random.randint(50, 200)
-            current_position += scroll_amount
-            
-            scroll_events.append({
-                "position": current_position,
-                "duration": random.uniform(0.1, 0.5) if pattern["speed"] == "slow" else random.uniform(0.05, 0.2)
-            })
-            
-            # Direction change (scroll up a bit)
-            if random.random() < pattern["direction_changes"]:
-                current_position -= random.randint(20, 100)
-                scroll_events.append({
-                    "position": current_position,
-                    "duration": random.uniform(0.1, 0.3)
-                })
-            
-            # Pause
-            if random.random() < pattern["pause_probability"]:
-                time.sleep(random.uniform(0.2, 1.0))
-        
-        return {
-            "events": scroll_events,
-            "total_distance": target_position,
-            "speed": pattern["speed"]
-        }
-    
-    def simulate_typing(self, text_length: int) -> Dict[str, Any]:
-        """Generate typing simulation parameters"""
-        pattern = random.choice(self.typing_patterns)
-        
-        keystrokes = []
-        errors = []
-        
-        for i in range(text_length):
-            # Simulate keystroke
-            keystroke_time = random.uniform(0.05, 0.3) if pattern["speed"] == "slow" else random.uniform(0.02, 0.1)
-            keystrokes.append(keystroke_time)
-            
-            # Simulate error
-            if random.random() < pattern["error_rate"]:
-                errors.append(i)
-                # Time to notice and correct error
-                keystrokes.append(random.uniform(0.3, 0.8))
-            
-            # Pause between words
-            if random.random() < pattern["pause_probability"] and i > 0 and i % 5 == 0:
-                keystrokes.append(random.uniform(0.5, 1.5))
-        
-        return {
-            "keystroke_times": keystrokes,
-            "error_positions": errors,
-            "total_time": sum(keystrokes),
-            "speed": pattern["speed"]
-        }
-
-
-class ReinforcementLearningAgent:
-    """Simple reinforcement learning agent for evasion strategy optimization"""
-    
-    def __init__(self):
-        self.q_table = defaultdict(lambda: defaultdict(float))
-        self.learning_rate = 0.1
-        self.discount_factor = 0.9
-        self.exploration_rate = 0.2
-        self.exploration_decay = 0.995
-        
-        # State features
-        self.state_features = [
-            "response_time",
-            "status_code",
-            "captcha_detected",
-            "redirect_count",
-            "content_length"
-        ]
-        
-        # Action space (evasion strategies)
-        self.actions = [
-            "rotate_tls_fingerprint",
-            "rotate_user_agent",
-            "add_mouse_movement",
-            "add_scroll_behavior",
-            "increase_delay",
-            "change_headers",
-            "rotate_proxy"
-        ]
-    
-    def get_state(self, response: Response) -> str:
-        """Extract state features from response"""
-        features = []
-        
-        # Response time bucket
-        response_time = response.meta.get('download_latency', 0)
-        if response_time < 1:
-            features.append("fast")
-        elif response_time < 3:
-            features.append("medium")
-        else:
-            features.append("slow")
-        
-        # Status code
-        features.append(f"status_{response.status}")
-        
-        # Check for common bot detection patterns
-        body = response.text.lower()
-        if any(indicator in body for indicator in ["captcha", "robot", "bot", "security check"]):
-            features.append("captcha_detected")
-        else:
-            features.append("no_captcha")
-        
-        # Redirect count
-        redirect_count = len(response.request.meta.get('redirect_urls', []))
-        features.append(f"redirects_{min(redirect_count, 3)}")
-        
-        return "_".join(features)
-    
-    def choose_action(self, state: str) -> str:
-        """Choose action using epsilon-greedy policy"""
-        if random.random() < self.exploration_rate:
-            return random.choice(self.actions)
-        else:
-            # Choose action with highest Q-value
-            if state in self.q_table:
-                return max(self.q_table[state].items(), key=lambda x: x[1])[0]
-            else:
-                return random.choice(self.actions)
-    
-    def update_q_value(self, state: str, action: str, reward: float, next_state: str):
-        """Update Q-value using Q-learning"""
-        current_q = self.q_table[state][action]
-        
-        # Find max Q-value for next state
-        if next_state in self.q_table and self.q_table[next_state]:
-            max_next_q = max(self.q_table[next_state].values())
-        else:
-            max_next_q = 0
-        
-        # Q-learning update
-        new_q = current_q + self.learning_rate * (
-            reward + self.discount_factor * max_next_q - current_q
-        )
-        
-        self.q_table[state][action] = new_q
-        
-        # Decay exploration rate
-        self.exploration_rate *= self.exploration_decay
-        self.exploration_rate = max(0.01, self.exploration_rate)
-    
-    def calculate_reward(self, response: Response) -> float:
-        """Calculate reward based on response"""
-        reward = 0.0
-        
-        # Positive reward for successful responses
-        if 200 <= response.status < 300:
-            reward += 1.0
-        
-        # Negative reward for blocks/detections
-        if response.status in [403, 429, 503]:
-            reward -= 2.0
-        
-        # Check for captcha
-        body = response.text.lower()
-        if any(indicator in body for indicator in ["captcha", "robot", "bot"]):
-            reward -= 3.0
-        
-        # Reward for reasonable response time
-        response_time = response.meta.get('download_latency', 0)
-        if 0.5 < response_time < 5:
-            reward += 0.5
-        
-        return reward
-
-
-class AdaptiveAntiBotEvasionMiddleware:
-    """Advanced anti-bot evasion middleware with ML-powered adaptation"""
-    
-    def __init__(self, user_agent: str = "Scrapy"):
+    def __init__(
+        self,
+        user_agent: str = "Scrapy",
+        fingerprints: Optional[List[Dict]] = None,
+        proxy_list: Optional[List[str]] = None,
+        captcha_services: Optional[Dict[str, str]] = None,
+        tls_profiles: Optional[List[Dict]] = None,
+        behavior_profiles: Optional[List[Dict]] = None,
+        learning_enabled: bool = True,
+        max_retries: int = 3
+    ):
         self.user_agent = user_agent
-        self.tls_generator = TLSFingerprintGenerator()
-        self.behavior_simulator = BehaviorSimulator()
-        self.rl_agent = ReinforcementLearningAgent()
+        self.fingerprints = fingerprints or self._generate_default_fingerprints()
+        self.proxy_list = proxy_list or []
+        self.captcha_services = captcha_services or {}
+        self.tls_profiles = tls_profiles or self._generate_tls_profiles()
+        self.behavior_profiles = behavior_profiles or self._generate_behavior_profiles()
+        self.learning_enabled = learning_enabled
+        self.max_retries = max_retries
         
-        # User agent rotation pool
-        self.user_agents = [
-            # Chrome
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            # Firefox
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0",
-            "Mozilla/5.0 (X11; Linux i686; rv:121.0) Gecko/20100101 Firefox/121.0",
-            # Safari
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
-            "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-            # Edge
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
-        ]
+        # ML components
+        self.request_history = deque(maxlen=1000)
+        self.block_patterns = {}
+        self.fingerprint_scores = {}
+        self.current_fingerprint_idx = 0
+        self.current_proxy_idx = 0
         
-        # Domain-specific strategies
-        self.domain_strategies = {}
-        self.domain_performance = defaultdict(lambda: {"success": 0, "total": 0})
+        # Initialize with default values
+        self.current_fingerprint = self.fingerprints[0] if self.fingerprints else {}
+        self.current_tls_profile = self.tls_profiles[0] if self.tls_profiles else {}
+        self.current_behavior_profile = self.behavior_profiles[0] if self.behavior_profiles else {}
         
-        # Request timing
-        self.last_request_time = defaultdict(float)
-        self.request_delay = defaultdict(lambda: random.uniform(1.0, 3.0))
-    
+        # WebRTC fingerprint cache
+        self.webrtc_fingerprints = self._generate_webrtc_fingerprints()
+        
+        # CAPTCHA solving state
+        self.captcha_solving = False
+        self.captcha_solution_cache = {}
+
     @classmethod
     def from_crawler(cls, crawler: Crawler) -> Self:
-        o = cls(crawler.settings.get("USER_AGENT", "Scrapy"))
+        settings = crawler.settings
+        
+        # Check if anti-bot evasion is enabled
+        if not settings.getbool('ANTI_BOT_ENABLED', False):
+            raise NotConfigured("Anti-bot evasion system not enabled")
+        
+        # Load fingerprints from settings or generate defaults
+        fingerprints = settings.getlist('ANTI_BOT_FINGERPRINTS', [])
+        if not fingerprints:
+            fingerprints = cls._generate_default_fingerprints()
+        
+        # Load proxy list
+        proxy_list = settings.getlist('ANTI_BOT_PROXY_LIST', [])
+        
+        # Load CAPTCHA service configurations
+        captcha_services = {
+            '2captcha': settings.get('CAPTCHA_2CAPTCHA_API_KEY', ''),
+            'anticaptcha': settings.get('CAPTCHA_ANTICAPTCHA_API_KEY', ''),
+            'capmonster': settings.get('CAPTCHA_CAPMONSTER_API_KEY', ''),
+        }
+        
+        # Load TLS profiles
+        tls_profiles = settings.getlist('ANTI_BOT_TLS_PROFILES', [])
+        if not tls_profiles:
+            tls_profiles = cls._generate_tls_profiles()
+        
+        # Load behavior profiles
+        behavior_profiles = settings.getlist('ANTI_BOT_BEHAVIOR_PROFILES', [])
+        if not behavior_profiles:
+            behavior_profiles = cls._generate_behavior_profiles()
+        
+        o = cls(
+            user_agent=settings.get('USER_AGENT', 'Scrapy'),
+            fingerprints=fingerprints,
+            proxy_list=proxy_list,
+            captcha_services=captcha_services,
+            tls_profiles=tls_profiles,
+            behavior_profiles=behavior_profiles,
+            learning_enabled=settings.getbool('ANTI_BOT_LEARNING_ENABLED', True),
+            max_retries=settings.getint('ANTI_BOT_MAX_RETRIES', 3)
+        )
+        
         crawler.signals.connect(o.spider_opened, signal=signals.spider_opened)
-        crawler.signals.connect(o.response_received, signal=signals.response_received)
+        crawler.signals.connect(o.spider_closed, signal=signals.spider_closed)
         return o
-    
+
     def spider_opened(self, spider: Spider) -> None:
-        if hasattr(spider, "user_agent"):  # pragma: no cover
+        if hasattr(spider, 'user_agent'):  # pragma: no cover
             warn_on_deprecated_spider_attribute("user_agent", "USER_AGENT")
         
-        self.user_agent = getattr(spider, "user_agent", self.user_agent)
-    
-    def response_received(self, response: Response, request: Request, spider: Spider) -> None:
-        """Process response to update evasion strategies"""
-        domain = self._get_domain(request.url)
+        self.user_agent = getattr(spider, 'user_agent', self.user_agent)
         
-        # Update TLS fingerprint performance
-        tls_success = 200 <= response.status < 400
-        self.tls_generator.update_performance(domain, tls_success)
+        # Initialize ML model if learning is enabled
+        if self.learning_enabled:
+            self._initialize_ml_model()
         
-        # Update domain performance
-        self.domain_performance[domain]["total"] += 1
-        if tls_success:
-            self.domain_performance[domain]["success"] += 1
-        
-        # Update reinforcement learning agent
-        state = self.rl_agent.get_state(response)
-        action = request.meta.get('evasion_action', 'none')
-        reward = self.rl_agent.calculate_reward(response)
-        
-        # Get next state (simplified)
-        next_state = state  # In a real implementation, this would be from the next response
-        
-        if action != 'none':
-            self.rl_agent.update_q_value(state, action, reward, next_state)
-        
-        # Adjust request delay based on performance
-        if response.status in [429, 503]:  # Rate limited
-            self.request_delay[domain] = min(self.request_delay[domain] * 1.5, 10.0)
-        elif tls_success:
-            self.request_delay[domain] = max(self.request_delay[domain] * 0.9, 0.5)
-    
-    def _get_domain(self, url: str) -> str:
-        """Extract domain from URL"""
-        from urllib.parse import urlparse
-        parsed = urlparse(url)
-        return parsed.netloc
-    
-    def _apply_behavior_simulation(self, request: Request):
-        """Apply behavior simulation to request"""
-        domain = self._get_domain(request.url)
-        
-        # Determine if we should simulate behavior
-        should_simulate = random.random() < 0.3  # 30% of requests
-        
-        if should_simulate:
-            # Choose behavior type
-            behavior_type = random.choice(["mouse", "scroll", "typing"])
-            
-            if behavior_type == "mouse":
-                mouse_data = self.behavior_simulator.simulate_mouse_movement()
-                request.meta['behavior_simulation'] = {
-                    'type': 'mouse_movement',
-                    'data': mouse_data
-                }
-            elif behavior_type == "scroll":
-                scroll_data = self.behavior_simulator.simulate_scroll()
-                request.meta['behavior_simulation'] = {
-                    'type': 'scroll',
-                    'data': scroll_data
-                }
-            elif behavior_type == "typing" and request.method == "POST":
-                # Only for POST requests (forms)
-                typing_data = self.behavior_simulator.simulate_typing(20)
-                request.meta['behavior_simulation'] = {
-                    'type': 'typing',
-                    'data': typing_data
-                }
-    
-    def _apply_tls_fingerprint(self, request: Request):
-        """Apply TLS fingerprint to request"""
-        domain = self._get_domain(request.url)
-        fingerprint = self.tls_generator.get_fingerprint(domain)
-        
-        # Store fingerprint info in request meta for potential use by download handlers
-        request.meta['tls_fingerprint'] = fingerprint
-        
-        # Add TLS-related headers
-        if 'application_layer_protocol_negotiation' in fingerprint.get('extensions', []):
-            request.headers['X-TLS-ALPN'] = 'h2,http/1.1'
-    
-    def _apply_evasion_strategy(self, request: Request):
-        """Apply ML-optimized evasion strategy"""
-        domain = self._get_domain(request.url)
-        
-        # Get current state (simplified)
-        state = "initial"  # In real implementation, this would be based on previous responses
-        
-        # Choose action using RL agent
-        action = self.rl_agent.choose_action(state)
-        request.meta['evasion_action'] = action
-        
-        # Apply chosen action
-        if action == "rotate_tls_fingerprint":
-            self._apply_tls_fingerprint(request)
-        elif action == "rotate_user_agent":
-            request.headers['User-Agent'] = random.choice(self.user_agents)
-        elif action == "add_mouse_movement":
-            mouse_data = self.behavior_simulator.simulate_mouse_movement()
-            request.meta['behavior_simulation'] = {
-                'type': 'mouse_movement',
-                'data': mouse_data
-            }
-        elif action == "add_scroll_behavior":
-            scroll_data = self.behavior_simulator.simulate_scroll()
-            request.meta['behavior_simulation'] = {
-                'type': 'scroll',
-                'data': scroll_data
-            }
-        elif action == "increase_delay":
-            time.sleep(random.uniform(1.0, 3.0))
-        elif action == "change_headers":
-            self._randomize_headers(request)
-        elif action == "rotate_proxy":
-            # Proxy rotation would be handled by a separate middleware
-            pass
-    
-    def _randomize_headers(self, request: Request):
-        """Randomize various headers to avoid fingerprinting"""
-        # Randomize Accept-Language
-        languages = [
-            "en-US,en;q=0.9",
-            "en-GB,en;q=0.8",
-            "fr-FR,fr;q=0.9,en;q=0.8",
-            "de-DE,de;q=0.9,en;q=0.8",
-            "es-ES,es;q=0.9,en;q=0.8"
-        ]
-        request.headers['Accept-Language'] = random.choice(languages)
-        
-        # Randomize Accept-Encoding
-        encodings = [
-            "gzip, deflate, br",
-            "gzip, deflate",
-            "br, gzip, deflate"
-        ]
-        request.headers['Accept-Encoding'] = random.choice(encodings)
-        
-        # Randomize Accept
-        accepts = [
-            "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "application/json,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
-        ]
-        request.headers['Accept'] = random.choice(accepts)
-        
-        # Randomize Connection
-        request.headers['Connection'] = random.choice(["keep-alive", "close"])
-        
-        # Randomize Upgrade-Insecure-Requests
-        if random.random() < 0.8:
-            request.headers['Upgrade-Insecure-Requests'] = "1"
-        
-        # Randomize Sec-Fetch headers
-        request.headers['Sec-Fetch-Dest'] = random.choice(["document", "empty", "script"])
-        request.headers['Sec-Fetch-Mode'] = random.choice(["navigate", "cors", "no-cors"])
-        request.headers['Sec-Fetch-Site'] = random.choice(["none", "same-origin", "cross-site"])
-        request.headers['Sec-Fetch-User'] = "?1"
-    
-    def _apply_request_delay(self, request: Request):
-        """Apply intelligent delay between requests"""
-        domain = self._get_domain(request.url)
-        current_time = time.time()
-        
-        if domain in self.last_request_time:
-            time_since_last = current_time - self.last_request_time[domain]
-            required_delay = self.request_delay[domain]
-            
-            if time_since_last < required_delay:
-                sleep_time = required_delay - time_since_last
-                # Add some randomness
-                sleep_time *= random.uniform(0.8, 1.2)
-                time.sleep(sleep_time)
-        
-        self.last_request_time[domain] = time.time()
-    
+        logger.info(f"AdaptiveAntiBotMiddleware initialized with {len(self.fingerprints)} fingerprints")
+
+    def spider_closed(self, spider: Spider) -> None:
+        """Save learned patterns when spider closes"""
+        if self.learning_enabled:
+            self._save_learned_patterns()
+
     @_warn_spider_arg
     def process_request(
         self, request: Request, spider: Spider | None = None
     ) -> Request | Response | None:
-        """Process request with anti-bot evasion"""
-        # Apply intelligent delay
-        self._apply_request_delay(request)
+        """Apply fingerprint, proxy, and behavior emulation to request"""
         
-        # Set user agent (with rotation)
-        if self.user_agent:
-            # Rotate user agent for certain domains or randomly
-            domain = self._get_domain(request.url)
-            if domain in self.domain_performance and self.domain_performance[domain]["total"] > 5:
-                success_rate = (self.domain_performance[domain]["success"] / 
-                              self.domain_performance[domain]["total"])
-                if success_rate < 0.5:
-                    # Poor performance, rotate user agent
-                    request.headers[b"User-Agent"] = random.choice(self.user_agents)
-                else:
-                    request.headers.setdefault(b"User-Agent", self.user_agent)
-            else:
-                request.headers.setdefault(b"User-Agent", self.user_agent)
+        # Skip if anti-bot evasion is disabled for this request
+        if request.meta.get('skip_anti_bot', False):
+            return None
         
-        # Apply TLS fingerprint
+        # Apply fingerprint headers
+        self._apply_fingerprint(request)
+        
+        # Apply TLS fingerprint (via headers and meta)
         self._apply_tls_fingerprint(request)
         
-        # Apply behavior simulation
-        self._apply_behavior_simulation(request)
+        # Apply WebRTC fingerprint spoofing
+        self._apply_webrtc_fingerprint(request)
         
-        # Apply ML-optimized evasion strategy
-        self._apply_evasion_strategy(request)
+        # Apply proxy rotation
+        self._apply_proxy(request)
         
-        # Randomize headers
-        self._randomize_headers(request)
+        # Apply behavior emulation (delays, etc.)
+        self._apply_behavior_emulation(request)
+        
+        # Store request metadata for learning
+        request.meta['anti_bot_fingerprint'] = self.current_fingerprint.get('id', 'unknown')
+        request.meta['anti_bot_proxy'] = request.meta.get('proxy', 'none')
+        request.meta['anti_bot_timestamp'] = time.time()
         
         return None
 
+    def process_response(
+        self, request: Request, response: Response, spider: Spider
+    ) -> Request | Response:
+        """Analyze response for blocking patterns and adapt"""
+        
+        # Record request/response for learning
+        if self.learning_enabled:
+            self._record_request_response(request, response)
+        
+        # Check for blocking patterns
+        is_blocked = self._detect_blocking(response)
+        
+        if is_blocked:
+            logger.warning(f"Blocking detected for {request.url} with fingerprint {self.current_fingerprint.get('id', 'unknown')}")
+            
+            # Check if we should retry with different fingerprint
+            retry_count = request.meta.get('anti_bot_retry_count', 0)
+            if retry_count < self.max_retries:
+                # Rotate to next fingerprint
+                self._rotate_fingerprint()
+                
+                # Create new request with different fingerprint
+                new_request = request.copy()
+                new_request.dont_filter = True
+                new_request.meta['anti_bot_retry_count'] = retry_count + 1
+                new_request.meta['anti_bot_original_url'] = request.url
+                
+                # Clear any previous fingerprint headers
+                for header in list(new_request.headers.keys()):
+                    if header.decode().lower().startswith('x-fingerprint'):
+                        del new_request.headers[header]
+                
+                logger.info(f"Retrying request with new fingerprint (attempt {retry_count + 1}/{self.max_retries})")
+                return new_request
+        
+        # Check for CAPTCHA
+        if self._detect_captcha(response):
+            logger.info(f"CAPTCHA detected for {request.url}")
+            
+            # Try to solve CAPTCHA if services are configured
+            if self.captcha_services and not self.captcha_solving:
+                captcha_solution = self._solve_captcha(response, request)
+                if captcha_solution:
+                    # Modify request with CAPTCHA solution
+                    return self._apply_captcha_solution(request, captcha_solution)
+        
+        return response
 
-# Backward compatibility
-UserAgentMiddleware = AdaptiveAntiBotEvasionMiddleware
+    def _apply_fingerprint(self, request: Request) -> None:
+        """Apply current fingerprint headers to request"""
+        if not self.current_fingerprint:
+            return
+        
+        # Apply User-Agent
+        if 'user_agent' in self.current_fingerprint:
+            request.headers['User-Agent'] = self.current_fingerprint['user_agent']
+        elif self.user_agent:
+            request.headers.setdefault(b'User-Agent', self.user_agent)
+        
+        # Apply other fingerprint headers
+        for header, value in self.current_fingerprint.get('headers', {}).items():
+            request.headers[header] = value
+        
+        # Add fingerprint identifier for tracking
+        request.headers['X-Fingerprint-ID'] = self.current_fingerprint.get('id', 'unknown')
+
+    def _apply_tls_fingerprint(self, request: Request) -> None:
+        """Apply TLS fingerprint emulation via headers"""
+        if not self.current_tls_profile:
+            return
+        
+        # TLS fingerprint emulation through headers
+        tls_headers = {
+            'Accept': self.current_tls_profile.get('accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'),
+            'Accept-Language': self.current_tls_profile.get('accept_language', 'en-US,en;q=0.5'),
+            'Accept-Encoding': self.current_tls_profile.get('accept_encoding', 'gzip, deflate, br'),
+            'Connection': self.current_tls_profile.get('connection', 'keep-alive'),
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': self.current_tls_profile.get('sec_fetch_dest', 'document'),
+            'Sec-Fetch-Mode': self.current_tls_profile.get('sec_fetch_mode', 'navigate'),
+            'Sec-Fetch-Site': self.current_tls_profile.get('sec_fetch_site', 'none'),
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': self.current_tls_profile.get('cache_control', 'max-age=0'),
+        }
+        
+        for header, value in tls_headers.items():
+            request.headers[header] = value
+        
+        # Store TLS profile in meta for download handler (if supported)
+        request.meta['tls_fingerprint'] = self.current_tls_profile.get('cipher_suites', [])
+
+    def _apply_webrtc_fingerprint(self, request: Request) -> None:
+        """Apply WebRTC fingerprint spoofing"""
+        if not self.webrtc_fingerprints:
+            return
+        
+        # Rotate WebRTC fingerprint
+        webrtc_fp = random.choice(self.webrtc_fingerprints)
+        
+        # Add WebRTC-related headers
+        request.headers['X-WebRTC-Local-IP'] = webrtc_fp.get('local_ip', '')
+        request.headers['X-WebRTC-Public-IP'] = webrtc_fp.get('public_ip', '')
+        
+        # Store in meta for potential JavaScript injection
+        request.meta['webrtc_fingerprint'] = webrtc_fp
+
+    def _apply_proxy(self, request: Request) -> None:
+        """Apply proxy rotation"""
+        if not self.proxy_list:
+            return
+        
+        # Skip if proxy already set
+        if request.meta.get('proxy'):
+            return
+        
+        # Rotate proxy
+        proxy = self.proxy_list[self.current_proxy_idx % len(self.proxy_list)]
+        self.current_proxy_idx += 1
+        
+        request.meta['proxy'] = proxy
+        
+        # Add proxy authentication if needed
+        if '@' in proxy:
+            # Extract credentials from proxy URL
+            auth_part = proxy.split('@')[0].split('://')[1]
+            username, password = auth_part.split(':')
+            request.meta['proxy_username'] = username
+            request.meta['proxy_password'] = password
+
+    def _apply_behavior_emulation(self, request: Request) -> None:
+        """Apply browser behavior emulation"""
+        if not self.current_behavior_profile:
+            return
+        
+        # Add random delays between requests
+        delay = self.current_behavior_profile.get('request_delay', 0)
+        if delay > 0:
+            time.sleep(random.uniform(0, delay))
+        
+        # Set referer based on behavior profile
+        if 'referer' in self.current_behavior_profile:
+            request.headers['Referer'] = self.current_behavior_profile['referer']
+        
+        # Add other behavior emulation headers
+        behavior_headers = self.current_behavior_profile.get('headers', {})
+        for header, value in behavior_headers.items():
+            request.headers[header] = value
+
+    def _detect_blocking(self, response: Response) -> bool:
+        """Detect if request was blocked based on response patterns"""
+        
+        # Check HTTP status codes
+        if response.status in [403, 429, 503]:
+            return True
+        
+        # Check for common blocking patterns in response body
+        blocking_patterns = [
+            'access denied',
+            'blocked',
+            'captcha',
+            'robot',
+            'suspicious activity',
+            'rate limit',
+            'too many requests',
+            'cloudflare',
+            'akamai',
+            'incapsula',
+            'distil',
+            'imperva'
+        ]
+        
+        response_text = response.text.lower()
+        for pattern in blocking_patterns:
+            if pattern in response_text:
+                return True
+        
+        # Check response headers for blocking indicators
+        server_header = response.headers.get('Server', b'').decode().lower()
+        if any(blocker in server_header for blocker in ['cloudflare', 'akamai', 'incapsula']):
+            # Check if it's actually blocking or just using the service
+            if 'challenge' in response_text or 'captcha' in response_text:
+                return True
+        
+        # ML-based detection if learning is enabled
+        if self.learning_enabled:
+            return self._ml_detect_blocking(response)
+        
+        return False
+
+    def _detect_captcha(self, response: Response) -> bool:
+        """Detect CAPTCHA in response"""
+        captcha_indicators = [
+            'captcha',
+            'recaptcha',
+            'hcaptcha',
+            'funcaptcha',
+            'security check',
+            'verify you are human',
+            'i\'m not a robot',
+            'please verify'
+        ]
+        
+        response_text = response.text.lower()
+        return any(indicator in response_text for indicator in captcha_indicators)
+
+    def _solve_captcha(self, response: Response, request: Request) -> Optional[Dict]:
+        """Attempt to solve CAPTCHA using configured services"""
+        # This is a simplified implementation
+        # In production, you would integrate with actual CAPTCHA solving APIs
+        
+        captcha_type = self._identify_captcha_type(response)
+        
+        # Try each configured service
+        for service_name, api_key in self.captcha_services.items():
+            if not api_key:
+                continue
+            
+            try:
+                # Mock implementation - replace with actual API calls
+                solution = self._call_captcha_service(service_name, api_key, response, captcha_type)
+                if solution:
+                    logger.info(f"CAPTCHA solved using {service_name}")
+                    return solution
+            except Exception as e:
+                logger.error(f"Failed to solve CAPTCHA with {service_name}: {e}")
+        
+        return None
+
+    def _identify_captcha_type(self, response: Response) -> str:
+        """Identify the type of CAPTCHA"""
+        response_text = response.text.lower()
+        
+        if 'recaptcha' in response_text:
+            if 'recaptcha v3' in response_text:
+                return 'recaptcha_v3'
+            elif 'recaptcha v2' in response_text:
+                return 'recaptcha_v2'
+            else:
+                return 'recaptcha'
+        elif 'hcaptcha' in response_text:
+            return 'hcaptcha'
+        elif 'funcaptcha' in response_text:
+            return 'funcaptcha'
+        else:
+            return 'unknown'
+
+    def _call_captcha_service(self, service_name: str, api_key: str, response: Response, captcha_type: str) -> Optional[Dict]:
+        """Call CAPTCHA solving service API"""
+        # Mock implementation - in reality, you would make HTTP requests to the service
+        # This is where you would implement the actual API integration
+        
+        # For demonstration, return a mock solution
+        if captcha_type.startswith('recaptcha'):
+            return {
+                'type': 'recaptcha',
+                'solution': 'mock_recaptcha_solution_token',
+                'response_field': 'g-recaptcha-response'
+            }
+        
+        return None
+
+    def _apply_captcha_solution(self, request: Request, solution: Dict) -> Request:
+        """Apply CAPTCHA solution to request"""
+        new_request = request.copy()
+        
+        # Add solution to form data or headers based on CAPTCHA type
+        if solution['type'] == 'recaptcha':
+            # For reCAPTCHA, add the solution token to form data
+            if 'form_data' not in new_request.meta:
+                new_request.meta['form_data'] = {}
+            new_request.meta['form_data'][solution['response_field']] = solution['solution']
+        
+        # Mark request as having CAPTCHA solution
+        new_request.meta['captcha_solved'] = True
+        new_request.meta['captcha_solution'] = solution
+        
+        return new_request
+
+    def _rotate_fingerprint(self) -> None:
+        """Rotate to next fingerprint"""
+        if not self.fingerprints:
+            return
+        
+        self.current_fingerprint_idx = (self.current_fingerprint_idx + 1) % len(self.fingerprints)
+        self.current_fingerprint = self.fingerprints[self.current_fingerprint_idx]
+        
+        # Also rotate TLS and behavior profiles
+        if self.tls_profiles:
+            self.current_tls_profile = random.choice(self.tls_profiles)
+        
+        if self.behavior_profiles:
+            self.current_behavior_profile = random.choice(self.behavior_profiles)
+        
+        logger.debug(f"Rotated to fingerprint {self.current_fingerprint.get('id', 'unknown')}")
+
+    def _record_request_response(self, request: Request, response: Response) -> None:
+        """Record request/response for ML learning"""
+        record = {
+            'url': request.url,
+            'method': request.method,
+            'status': response.status,
+            'fingerprint_id': request.meta.get('anti_bot_fingerprint', 'unknown'),
+            'proxy': request.meta.get('anti_bot_proxy', 'none'),
+            'timestamp': time.time(),
+            'response_time': response.flags.get('download_latency', 0),
+            'blocked': self._detect_blocking(response),
+            'captcha': self._detect_captcha(response)
+        }
+        
+        self.request_history.append(record)
+        
+        # Update fingerprint scores
+        fingerprint_id = record['fingerprint_id']
+        if fingerprint_id not in self.fingerprint_scores:
+            self.fingerprint_scores[fingerprint_id] = {'success': 0, 'blocked': 0}
+        
+        if record['blocked'] or record['captcha']:
+            self.fingerprint_scores[fingerprint_id]['blocked'] += 1
+        else:
+            self.fingerprint_scores[fingerprint_id]['success'] += 1
+
+    def _ml_detect_blocking(self, response: Response) -> bool:
+        """ML-based blocking detection"""
+        # Simplified ML detection - in reality, you would use a trained model
+        # This is a placeholder for actual ML implementation
+        
+        # Analyze response patterns
+        features = {
+            'status_code': response.status,
+            'content_length': len(response.body),
+            'has_captcha': self._detect_captcha(response),
+            'redirect_count': len(response.request.meta.get('redirect_urls', [])),
+            'response_time': response.flags.get('download_latency', 0)
+        }
+        
+        # Simple rule-based ML (replace with actual model)
+        if features['status_code'] in [403, 429]:
+            return True
+        
+        if features['has_captcha']:
+            return True
+        
+        # Check for suspiciously short responses
+        if features['content_length'] < 1000 and features['status_code'] == 200:
+            # Might be a challenge page
+            return True
+        
+        return False
+
+    def _initialize_ml_model(self) -> None:
+        """Initialize ML model for pattern learning"""
+        # Placeholder for ML model initialization
+        # In reality, you would load a pre-trained model or initialize a new one
+        logger.info("Initializing ML model for anti-bot pattern learning")
+
+    def _save_learned_patterns(self) -> None:
+        """Save learned patterns for future use"""
+        # Placeholder for saving learned patterns
+        # In reality, you would serialize and save the model/patterns
+        logger.info(f"Saving learned patterns: {len(self.request_history)} records")
+
+    @staticmethod
+    def _generate_default_fingerprints() -> List[Dict]:
+        """Generate default browser fingerprints"""
+        return [
+            {
+                'id': 'chrome_win_1',
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'headers': {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                'platform': 'Win32',
+                'vendor': 'Google Inc.'
+            },
+            {
+                'id': 'firefox_mac_1',
+                'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:121.0) Gecko/20100101 Firefox/121.0',
+                'headers': {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                },
+                'platform': 'MacIntel',
+                'vendor': ''
+            },
+            {
+                'id': 'safari_mac_1',
+                'user_agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15',
+                'headers': {
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive'
+                },
+                'platform': 'MacIntel',
+                'vendor': 'Apple Computer, Inc.'
+            }
+        ]
+
+    @staticmethod
+    def _generate_tls_profiles() -> List[Dict]:
+        """Generate TLS fingerprint profiles"""
+        return [
+            {
+                'id': 'chrome_tls_1',
+                'cipher_suites': [
+                    'TLS_AES_128_GCM_SHA256',
+                    'TLS_AES_256_GCM_SHA384',
+                    'TLS_CHACHA20_POLY1305_SHA256'
+                ],
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'accept_language': 'en-US,en;q=0.5',
+                'accept_encoding': 'gzip, deflate, br',
+                'sec_fetch_dest': 'document',
+                'sec_fetch_mode': 'navigate',
+                'sec_fetch_site': 'none',
+                'cache_control': 'max-age=0'
+            },
+            {
+                'id': 'firefox_tls_1',
+                'cipher_suites': [
+                    'TLS_AES_128_GCM_SHA256',
+                    'TLS_CHACHA20_POLY1305_SHA256',
+                    'TLS_AES_256_GCM_SHA384'
+                ],
+                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'accept_language': 'en-US,en;q=0.5',
+                'accept_encoding': 'gzip, deflate, br',
+                'sec_fetch_dest': 'document',
+                'sec_fetch_mode': 'navigate',
+                'sec_fetch_site': 'none',
+                'cache_control': 'max-age=0'
+            }
+        ]
+
+    @staticmethod
+    def _generate_behavior_profiles() -> List[Dict]:
+        """Generate browser behavior emulation profiles"""
+        return [
+            {
+                'id': 'human_like_1',
+                'request_delay': 1.5,
+                'scroll_behavior': True,
+                'mouse_movement': True,
+                'headers': {
+                    'DNT': '1',
+                    'Sec-GPC': '1'
+                }
+            },
+            {
+                'id': 'fast_1',
+                'request_delay': 0.5,
+                'scroll_behavior': False,
+                'mouse_movement': False,
+                'headers': {}
+            },
+            {
+                'id': 'slow_1',
+                'request_delay': 3.0,
+                'scroll_behavior': True,
+                'mouse_movement': True,
+                'headers': {
+                    'DNT': '1'
+                }
+            }
+        ]
+
+    @staticmethod
+    def _generate_webrtc_fingerprints() -> List[Dict]:
+        """Generate WebRTC fingerprint spoofing data"""
+        return [
+            {
+                'local_ip': '192.168.1.100',
+                'public_ip': '203.0.113.45',
+                'network_type': 'wifi',
+                'bandwidth': '10mbps'
+            },
+            {
+                'local_ip': '10.0.0.50',
+                'public_ip': '198.51.100.23',
+                'network_type': 'ethernet',
+                'bandwidth': '100mbps'
+            },
+            {
+                'local_ip': '172.16.0.25',
+                'public_ip': '192.0.2.123',
+                'network_type': 'cellular',
+                'bandwidth': '5mbps'
+            }
+        ]
+
+
+# Keep backward compatibility
+UserAgentMiddleware = AdaptiveAntiBotMiddleware
